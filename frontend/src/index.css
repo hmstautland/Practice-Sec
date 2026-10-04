@@ -1,0 +1,22 @@
+:root { font-family: system-ui, sans-serif; color: #1f2430; background: #f5f6fa; }
+body { margin: 0; }
+nav { display: flex; gap: 1rem; align-items: center; padding: .75rem 1.5rem; background: #1f2430; }
+nav a { color: #cfd6ee; text-decoration: none; }
+nav a.active { color: #fff; font-weight: 600; }
+nav span { color: #cfd6ee; }
+.spacer { flex: 1; }
+main { max-width: 900px; margin: 1.5rem auto; padding: 0 1rem; }
+.card { background: #fff; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; box-shadow: 0 1px 3px #0002; display: flex; flex-direction: column; gap: .5rem; }
+.card.narrow { max-width: 360px; margin: 4rem auto; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+input, textarea { padding: .5rem; border: 1px solid #c9cee0; border-radius: 4px; font: inherit; }
+label { display: flex; flex-direction: column; gap: .25rem; font-size: .85rem; }
+button { padding: .45rem .9rem; border: 0; border-radius: 4px; background: #3b5bdb; color: #fff; cursor: pointer; align-self: flex-start; }
+.author { display: flex; align-items: center; gap: .5rem; }
+.author img, .friends img, .avatar { border-radius: 50%; object-fit: cover; }
+.friends { list-style: none; padding: 0; display: flex; flex-direction: column; gap: .75rem; }
+.friends li { display: flex; gap: .75rem; align-items: center; }
+.search { display: flex; gap: .5rem; margin-bottom: 1rem; }
+.search input { flex: 1; }
+.error { color: #c92a2a; }
