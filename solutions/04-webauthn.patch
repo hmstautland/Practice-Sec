@@ -1,0 +1,361 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/backend/src/SecLab.Api/appsettings.json sol04/backend/src/SecLab.Api/appsettings.json
+--- a/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:08:48.219603649 +0200
++++ b/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:13:29.384102165 +0200
+@@ -6,6 +6,11 @@
+     "Authority": "https://login.seclab.example/realms/seclab",
+     "Audience": "seclab-api"
+   },
++  "WebAuthn": {
++    "RpId": "localhost",
++    "RpName": "SecLab",
++    "Origins": [ "https://localhost:5173" ]
++  },
+   "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } },
+   "AllowedHosts": "*"
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/backend/src/SecLab.Api/Data/AppDbContext.cs sol04/backend/src/SecLab.Api/Data/AppDbContext.cs
+--- a/backend/src/SecLab.Api/Data/AppDbContext.cs	2026-09-30 11:08:04.531442458 +0200
++++ b/backend/src/SecLab.Api/Data/AppDbContext.cs	2026-09-30 11:13:29.384081776 +0200
+@@ -9,10 +9,12 @@
+     public DbSet<Friendship> Friendships => Set<Friendship>();
+     public DbSet<Blog> Blogs => Set<Blog>();
+     public DbSet<BlogLike> BlogLikes => Set<BlogLike>();
++    public DbSet<Passkey> Passkeys => Set<Passkey>();
+ 
+     protected override void OnModelCreating(ModelBuilder b)
+     {
+         b.Entity<Friendship>().HasKey(f => new { f.UserId, f.FriendId });
+         b.Entity<BlogLike>().HasKey(l => new { l.UserId, l.BlogId });
++        b.Entity<Passkey>().HasIndex(p => p.CredentialId).IsUnique();
+     }
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/backend/src/SecLab.Api/Endpoints/Api.cs sol04/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:08:04.554462443 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:13:29.384153191 +0200
+@@ -3,6 +3,7 @@
+ using System.Text.RegularExpressions;
+ using Microsoft.AspNetCore.Identity;
+ using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Caching.Memory;
+ using SecLab.Api.Data;
+ using SecLab.Api.Models;
+ 
+@@ -13,7 +14,7 @@
+ public static class Api
+ {
+     // Identity now comes from the validated access token: preferred_username maps to the local user.
+-    static async Task<int?> CurrentUserId(HttpContext ctx, AppDbContext db)
++    internal static async Task<int?> CurrentUserId(HttpContext ctx, AppDbContext db)
+     {
+         var username = ctx.User.FindFirst("preferred_username")?.Value;
+         if (string.IsNullOrEmpty(username)) return null;
+@@ -87,6 +88,23 @@
+                 ? Results.Ok(await db.Users.Where(u => u.Id == id).Select(u => new { u.Id, u.Username, u.DisplayName, u.Email, u.Phone, u.Address, u.AvatarUrl, u.Bio, u.Role }).FirstAsync())
+                 : Results.Unauthorized());
+ 
++        Passkeys.Map(api);
++
++        // Deleting an account is destructive: it needs a fresh passkey assertion (step-up), not just a valid session.
++        api.MapDelete("/me", async (HttpContext ctx, AppDbContext db, IMemoryCache cache) =>
++        {
++            if (await CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
++            var username = ctx.User.FindFirst("preferred_username")!.Value;
++            if (!Passkeys.ConsumeStepUp(ctx, cache, username)) return Results.StatusCode(StatusCodes.Status403Forbidden);
++
++            await db.BlogLikes.Where(l => l.UserId == uid).ExecuteDeleteAsync();
++            await db.Friendships.Where(f => f.UserId == uid || f.FriendId == uid).ExecuteDeleteAsync();
++            await db.Passkeys.Where(p => p.UserId == uid).ExecuteDeleteAsync();
++            await db.Blogs.Where(b => b.AuthorId == uid).ExecuteDeleteAsync();
++            await db.Users.Where(u => u.Id == uid).ExecuteDeleteAsync();
++            return Results.NoContent();
++        });
++
+         // ---- Profile ----
+         // WEAKNESS: IDOR - any caller can read any user, including the Password column.
+         api.MapGet("/users/{id:int}", async (int id, AppDbContext db) =>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/backend/src/SecLab.Api/Endpoints/Passkeys.cs sol04/backend/src/SecLab.Api/Endpoints/Passkeys.cs
+--- a/backend/src/SecLab.Api/Endpoints/Passkeys.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Endpoints/Passkeys.cs	2026-09-30 11:13:53.041372305 +0200
+@@ -0,0 +1,126 @@
++using System.Security.Cryptography;
++using Fido2NetLib;
++using Fido2NetLib.Objects;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Caching.Memory;
++using SecLab.Api.Data;
++using SecLab.Api.Models;
++
++namespace SecLab.Api.Endpoints;
++
++// WebAuthn used for step-up: a signed-in user proves presence + verification with a passkey
++// and receives a short-lived, single-use token that sensitive endpoints demand in X-StepUp.
++public static class Passkeys
++{
++    static readonly TimeSpan CeremonyLifetime = TimeSpan.FromMinutes(5);
++    static string Key(string kind, int userId) => $"webauthn:{kind}:{userId}";
++
++    public static void Map(RouteGroupBuilder api)
++    {
++        var g = api.MapGroup("/passkeys");
++
++        g.MapPost("/register/options", async (HttpContext ctx, AppDbContext db, IFido2 fido2, IMemoryCache cache) =>
++        {
++            if (await Api.CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
++            var user = await db.Users.FirstAsync(u => u.Id == uid);
++            var existing = await db.Passkeys.Where(p => p.UserId == uid).ToListAsync();
++            var handle = existing.FirstOrDefault()?.UserHandle ?? RandomNumberGenerator.GetBytes(16);
++
++            var options = fido2.RequestNewCredential(new RequestNewCredentialParams
++            {
++                User = new Fido2User { Id = handle, Name = user.Username, DisplayName = user.DisplayName },
++                ExcludeCredentials = existing.Select(p => new PublicKeyCredentialDescriptor(p.CredentialId)).ToList(),
++                AuthenticatorSelection = new AuthenticatorSelection { ResidentKey = ResidentKeyRequirement.Preferred, UserVerification = UserVerificationRequirement.Required },
++                AttestationPreference = AttestationConveyancePreference.None,
++            });
++
++            cache.Set(Key("reg", uid), options.ToJson(), CeremonyLifetime);
++            return Results.Content(options.ToJson(), "application/json");
++        });
++
++        g.MapPost("/register/complete", async (AuthenticatorAttestationRawResponse response, HttpContext ctx, AppDbContext db, IFido2 fido2, IMemoryCache cache) =>
++        {
++            if (await Api.CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
++            // Single use: take the challenge out of the cache *before* verifying anything.
++            if (!cache.TryGetValue(Key("reg", uid), out string? json)) return Results.BadRequest(new { error = "No registration in progress" });
++            cache.Remove(Key("reg", uid));
++            var options = CredentialCreateOptions.FromJson(json!);
++
++            try
++            {
++                var cred = await fido2.MakeNewCredentialAsync(new MakeNewCredentialParams
++                {
++                    AttestationResponse = response,
++                    OriginalOptions = options,
++                    IsCredentialIdUniqueToUserCallback = async (args, ct) => !await db.Passkeys.AnyAsync(p => p.CredentialId == args.CredentialId, ct),
++                });
++                db.Passkeys.Add(new Passkey { UserId = uid, CredentialId = cred.Id, PublicKey = cred.PublicKey, SignCount = cred.SignCount, UserHandle = options.User.Id });
++                await db.SaveChangesAsync();
++                return Results.Ok(new { id = Convert.ToBase64String(cred.Id) });
++            }
++            catch (Fido2VerificationException)
++            {
++                return Results.BadRequest(new { error = "Passkey registration failed" });
++            }
++        });
++
++        g.MapPost("/assert/options", async (HttpContext ctx, AppDbContext db, IFido2 fido2, IMemoryCache cache) =>
++        {
++            if (await Api.CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
++            var keys = await db.Passkeys.Where(p => p.UserId == uid).Select(p => new PublicKeyCredentialDescriptor(p.CredentialId)).ToListAsync();
++            if (keys.Count == 0) return Results.BadRequest(new { error = "Register a passkey first" });
++
++            var options = fido2.GetAssertionOptions(new GetAssertionOptionsParams { AllowedCredentials = keys, UserVerification = UserVerificationRequirement.Required });
++            cache.Set(Key("assert", uid), options.ToJson(), CeremonyLifetime);
++            return Results.Content(options.ToJson(), "application/json");
++        });
++
++        g.MapPost("/assert/complete", async (AuthenticatorAssertionRawResponse response, HttpContext ctx, AppDbContext db, IFido2 fido2, IMemoryCache cache) =>
++        {
++            if (await Api.CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
++            if (!cache.TryGetValue(Key("assert", uid), out string? json)) return Results.BadRequest(new { error = "No assertion in progress" });
++            cache.Remove(Key("assert", uid));
++            var options = AssertionOptions.FromJson(json!);
++
++            // The credential must exist *and belong to the caller*.
++            var stored = await db.Passkeys.FirstOrDefaultAsync(p => p.UserId == uid && p.CredentialId == response.RawId);
++            if (stored is null) return Results.BadRequest(new { error = "Unknown credential" });
++
++            try
++            {
++                var result = await fido2.MakeAssertionAsync(new MakeAssertionParams
++                {
++                    AssertionResponse = response,
++                    OriginalOptions = options,
++                    StoredPublicKey = stored.PublicKey,
++                    StoredSignatureCounter = stored.SignCount,
++                    IsUserHandleOwnerOfCredentialIdCallback = (args, ct) => Task.FromResult(args.UserHandle is not null && args.UserHandle.SequenceEqual(stored.UserHandle)),
++                });
++                stored.SignCount = result.SignCount;           // a value that does not increase is rejected by the library
++                await db.SaveChangesAsync();
++            }
++            catch (Fido2VerificationException)
++            {
++                return Results.BadRequest(new { error = "Passkey assertion failed" });
++            }
++
++            var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
++            cache.Set($"stepup:{token}", ctx.User.FindFirst("preferred_username")!.Value, CeremonyLifetime);
++            return Results.Ok(new { stepUpToken = token, expiresIn = (int)CeremonyLifetime.TotalSeconds });
++        });
++
++        g.MapGet("/", async (HttpContext ctx, AppDbContext db) =>
++            await Api.CurrentUserId(ctx, db) is { } uid
++                ? Results.Ok(await db.Passkeys.Where(p => p.UserId == uid).Select(p => new { p.Id, p.Name, p.CreatedAt }).ToListAsync())
++                : Results.Unauthorized());
++    }
++
++    /// <summary>Validates the X-StepUp header for this user and burns the token (single use).</summary>
++    public static bool ConsumeStepUp(HttpContext ctx, IMemoryCache cache, string username)
++    {
++        var token = ctx.Request.Headers["X-StepUp"].ToString();
++        if (string.IsNullOrEmpty(token) || !cache.TryGetValue($"stepup:{token}", out string? owner) || owner != username) return false;
++        cache.Remove($"stepup:{token}");
++        return true;
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/backend/src/SecLab.Api/Models/Models.cs sol04/backend/src/SecLab.Api/Models/Models.cs
+--- a/backend/src/SecLab.Api/Models/Models.cs	2026-09-30 11:08:04.531493624 +0200
++++ b/backend/src/SecLab.Api/Models/Models.cs	2026-09-30 11:13:29.384057641 +0200
+@@ -38,3 +38,15 @@
+     public int UserId { get; set; }
+     public int BlogId { get; set; }
+ }
++
++public class Passkey
++{
++    public int Id { get; set; }
++    public int UserId { get; set; }
++    [System.ComponentModel.DataAnnotations.MaxLength(512)] public byte[] CredentialId { get; set; } = [];
++    public byte[] PublicKey { get; set; } = [];
++    public uint SignCount { get; set; }
++    public byte[] UserHandle { get; set; } = [];        // opaque random id for the user, never a name or e-mail
++    public string Name { get; set; } = "Passkey";
++    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/backend/src/SecLab.Api/Program.cs sol04/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 11:08:04.554354531 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 11:13:29.384121591 +0200
+@@ -20,6 +20,13 @@
+     o.TokenValidationParameters.ClockSkew = TimeSpan.FromSeconds(30);   // default is 5 minutes!
+ });
+ builder.Services.AddAuthorization();
++builder.Services.AddMemoryCache();
++builder.Services.AddFido2(o =>
++{
++    o.ServerDomain = builder.Configuration["WebAuthn:RpId"]!;                        // the relying-party id: a registrable domain, no scheme/port
++    o.ServerName = builder.Configuration["WebAuthn:RpName"]!;
++    o.Origins = builder.Configuration.GetSection("WebAuthn:Origins").Get<HashSet<string>>()!;   // exact origins that may run the ceremony
++});
+ builder.Services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
+ builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
+ // WEAKNESS: wide-open CORS.
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/backend/src/SecLab.Api/SecLab.Api.csproj sol04/backend/src/SecLab.Api/SecLab.Api.csproj
+--- a/backend/src/SecLab.Api/SecLab.Api.csproj	2026-09-30 11:08:04.554251688 +0200
++++ b/backend/src/SecLab.Api/SecLab.Api.csproj	2026-09-30 11:13:29.384031311 +0200
+@@ -6,6 +6,7 @@
+   </PropertyGroup>
+   <ItemGroup>
+     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
++    <PackageReference Include="Fido2.AspNet" Version="4.1.1" />
+     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.0" />
+     <PackageReference Include="Microsoft.Extensions.Identity.Core" Version="10.0.0" />
+   </ItemGroup>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/frontend/package.json sol04/frontend/package.json
+--- a/frontend/package.json	2026-09-30 11:09:10.597153652 +0200
++++ b/frontend/package.json	2026-09-30 11:14:37.769710338 +0200
+@@ -10,6 +10,7 @@
+     "preview": "vite preview"
+   },
+   "dependencies": {
++    "@simplewebauthn/browser": "^14.0.0",
+     "oidc-client-ts": "^3.5.0",
+     "react": "^19.2.8",
+     "react-dom": "^19.2.8",
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/frontend/package-lock.json sol04/frontend/package-lock.json
+--- a/frontend/package-lock.json	2026-09-30 11:09:10.605153707 +0200
++++ b/frontend/package-lock.json	2026-09-30 11:14:37.787710580 +0200
+@@ -8,6 +8,7 @@
+       "name": "frontend",
+       "version": "0.0.0",
+       "dependencies": {
++        "@simplewebauthn/browser": "^14.0.0",
+         "oidc-client-ts": "^3.5.0",
+         "react": "^19.2.8",
+         "react-dom": "^19.2.8",
+@@ -660,6 +661,12 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/@simplewebauthn/browser": {
++      "version": "14.0.0",
++      "resolved": "https://registry.npmjs.org/@simplewebauthn/browser/-/browser-14.0.0.tgz",
++      "integrity": "sha512-1odWVqeEBTl7lJ9zMKLEsmTlnyrDO5iRcTvfMKKk1WThUnp/i8JJdffdj2icP+tty159s4PgwE3BiMoEW9NFow==",
++      "license": "MIT"
++    },
+     "node_modules/@types/node": {
+       "version": "24.19.0",
+       "resolved": "https://registry.npmjs.org/@types/node/-/node-24.19.0.tgz",
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/frontend/src/api/client.ts sol04/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-09-30 11:09:10.754577855 +0200
++++ b/frontend/src/api/client.ts	2026-09-30 11:14:37.823711063 +0200
+@@ -44,6 +44,12 @@
+   createBlog: (authorId: number, title: string, body: string) =>
+     request<Blog>('/api/blogs', { method: 'POST', body: JSON.stringify({ authorId, title, body }) }),
+   likes: (id: number) => request<Blog[]>(`/api/users/${id}/likes`),
++  passkeys: () => request<{ id: number; name: string; createdAt: string }[]>('/api/passkeys'),
++  registerOptions: () => request<any>('/api/passkeys/register/options', { method: 'POST', body: '{}' }),
++  registerComplete: (attestation: unknown) => request<{ id: string }>('/api/passkeys/register/complete', { method: 'POST', body: JSON.stringify(attestation) }),
++  assertOptions: () => request<any>('/api/passkeys/assert/options', { method: 'POST', body: '{}' }),
++  assertComplete: (assertion: unknown) => request<{ stepUpToken: string }>('/api/passkeys/assert/complete', { method: 'POST', body: JSON.stringify(assertion) }),
++  deleteAccount: (stepUpToken: string) => request<void>('/api/me', { method: 'DELETE', headers: { 'X-StepUp': stepUpToken } }),
+   timeline: () => request<Blog[]>('/api/timeline'),
+   like: (blogId: number) => request<void>(`/api/blogs/${blogId}/like`, { method: 'POST' }),
+   unlike: (blogId: number) => request<void>(`/api/blogs/${blogId}/like`, { method: 'DELETE' }),
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid04/frontend/src/pages/Profile.tsx sol04/frontend/src/pages/Profile.tsx
+--- a/frontend/src/pages/Profile.tsx	2026-09-30 11:09:10.754647566 +0200
++++ b/frontend/src/pages/Profile.tsx	2026-09-30 11:14:37.824447645 +0200
+@@ -1,4 +1,6 @@
+ import { useEffect, useState } from 'react'
++import { startAuthentication, startRegistration } from '@simplewebauthn/browser'
++import { userManager } from '../api/auth'
+ import { api, API_BASE, currentUser, setSession, type User } from '../api/client'
+ 
+ export default function Profile() {
+@@ -6,10 +8,12 @@
+   const [user, setUser] = useState<User | null>(null)
+   const [friends, setFriends] = useState<User[]>([])
+   const [msg, setMsg] = useState('')
++  const [passkeys, setPasskeys] = useState<{ id: number; name: string; createdAt: string }[]>([])
+ 
+   useEffect(() => {
+     api.user(me.id).then(setUser)
+     api.friends(me.id).then(setFriends)
++    api.passkeys().then(setPasskeys)
+   }, [me.id])
+ 
+   if (!user) return <p>Loading…</p>
+@@ -27,6 +31,21 @@
+     setUser({ ...user, avatarUrl })
+   }
+ 
++  const addPasskey = async () => {
++    const optionsJSON = await api.registerOptions()
++    const attestation = await startRegistration({ optionsJSON })     // browser + authenticator do the ceremony
++    await api.registerComplete(attestation)
++    setPasskeys(await api.passkeys()); setMsg('Passkey added')
++  }
++  const deleteAccount = async () => {
++    if (!confirm('Delete your account permanently?')) return
++    const optionsJSON = await api.assertOptions()
++    const assertion = await startAuthentication({ optionsJSON })     // step-up: prove it is really you, right now
++    const { stepUpToken } = await api.assertComplete(assertion)
++    await api.deleteAccount(stepUpToken)
++    await userManager.signoutRedirect()
++  }
++
+   return (
+     <div className="grid">
+       <section className="card">
+@@ -41,6 +60,12 @@
+         <button onClick={save}>Save</button> {msg}
+       </section>
+       <section className="card">
++        <h2>Security</h2>
++        <p>Passkeys: {passkeys.length === 0 ? 'none yet' : passkeys.map(p => new Date(p.createdAt).toLocaleDateString()).join(', ')}</p>
++        <button onClick={addPasskey}>Add a passkey</button>
++        <button onClick={deleteAccount} disabled={passkeys.length === 0} title="Requires a passkey">Delete my account</button>
++      </section>
++      <section className="card">
+         <h2>Friends ({friends.length})</h2>
+         <ul className="friends">
+           {friends.map(f => (

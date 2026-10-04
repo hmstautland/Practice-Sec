@@ -1,0 +1,388 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/backend/src/SecLab.Api/appsettings.Development.json sol03/backend/src/SecLab.Api/appsettings.Development.json
+--- a/backend/src/SecLab.Api/appsettings.Development.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/appsettings.Development.json	2026-09-30 11:08:48.219616564 +0200
+@@ -0,0 +1,5 @@
++{
++  "Auth": {
++    "Authority": "http://localhost:8081/realms/seclab"
++  }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/backend/src/SecLab.Api/appsettings.json sol03/backend/src/SecLab.Api/appsettings.json
+--- a/backend/src/SecLab.Api/appsettings.json	2026-09-30 10:48:32.883317738 +0200
++++ b/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:08:48.219603649 +0200
+@@ -2,6 +2,10 @@
+   "ConnectionStrings": {
+     "Default": "Server=localhost,1433;Database=SecLab;User Id=sa;Password=Passw0rd!Passw0rd;TrustServerCertificate=True"
+   },
++  "Auth": {
++    "Authority": "https://login.seclab.example/realms/seclab",
++    "Audience": "seclab-api"
++  },
+   "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } },
+   "AllowedHosts": "*"
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/backend/src/SecLab.Api/Endpoints/Api.cs sol03/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 10:48:32.898990449 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:08:04.554462443 +0200
+@@ -12,16 +12,21 @@
+ // and is fixed in a tutorial step. Do not "fix" them outside the tutorial.
+ public static class Api
+ {
+-    // WEAKNESS: the "session" is just a header the client chooses.
+-    static int? CurrentUserId(HttpContext ctx) =>
+-        int.TryParse(ctx.Request.Headers["X-User-Id"], out var id) ? id : null;
++    // Identity now comes from the validated access token: preferred_username maps to the local user.
++    static async Task<int?> CurrentUserId(HttpContext ctx, AppDbContext db)
++    {
++        var username = ctx.User.FindFirst("preferred_username")?.Value;
++        if (string.IsNullOrEmpty(username)) return null;
++        return await db.Users.Where(u => u.Username == username).Select(u => (int?)u.Id).FirstOrDefaultAsync();
++    }
+ 
+     public static void Map(WebApplication app)
+     {
+-        var api = app.MapGroup("/api");
++        var api = app.MapGroup("/api").RequireAuthorization();          // authenticated by default
++        var auth = api.MapGroup("/auth").AllowAnonymous();            // legacy local login/registration stay public for now
+ 
+         // ---- Auth ----
+-        api.MapPost("/auth/register", async (RegisterRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
++        auth.MapPost("/register", async (RegisterRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
+         {
+             var errors = new Dictionary<string, string[]>();
+             if (!Regex.IsMatch(req.Username ?? "", "^[A-Za-z0-9_]{3,32}$")) errors["username"] = ["3-32 letters, digits or underscore"];
+@@ -37,7 +42,7 @@
+             return Results.Created($"/api/users/{user.Id}", new { user.Id, user.Username });
+         });
+ 
+-        api.MapPost("/auth/login", async (LoginRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
++        auth.MapPost("/login", async (LoginRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
+         {
+             // One answer for every failure: unknown user, wrong password and locked account look identical.
+             IResult Fail() => Results.Json(new { error = "Invalid username or password" }, statusCode: 401);
+@@ -76,6 +81,12 @@
+             return Results.Ok(new { token = user.Id.ToString(), user = new { user.Id, user.Username, user.DisplayName, user.Email, user.Phone, user.Address, user.AvatarUrl, user.Bio, user.Role } });
+         });
+ 
++        // The signed-in user, resolved from the token. Never returns the password column.
++        api.MapGet("/me", async (HttpContext ctx, AppDbContext db) =>
++            await CurrentUserId(ctx, db) is { } id
++                ? Results.Ok(await db.Users.Where(u => u.Id == id).Select(u => new { u.Id, u.Username, u.DisplayName, u.Email, u.Phone, u.Address, u.AvatarUrl, u.Bio, u.Role }).FirstAsync())
++                : Results.Unauthorized());
++
+         // ---- Profile ----
+         // WEAKNESS: IDOR - any caller can read any user, including the Password column.
+         api.MapGet("/users/{id:int}", async (int id, AppDbContext db) =>
+@@ -131,7 +142,7 @@
+ 
+         api.MapPost("/blogs/{id:int}/like", async (int id, HttpContext ctx, AppDbContext db) =>
+         {
+-            if (CurrentUserId(ctx) is not { } uid) return Results.Unauthorized();
++            if (await CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
+             if (!await db.BlogLikes.AnyAsync(l => l.UserId == uid && l.BlogId == id))
+             {
+                 db.BlogLikes.Add(new BlogLike { UserId = uid, BlogId = id });
+@@ -142,7 +153,7 @@
+ 
+         api.MapDelete("/blogs/{id:int}/like", async (int id, HttpContext ctx, AppDbContext db) =>
+         {
+-            if (CurrentUserId(ctx) is not { } uid) return Results.Unauthorized();
++            if (await CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
+             await db.BlogLikes.Where(l => l.UserId == uid && l.BlogId == id).ExecuteDeleteAsync();
+             return Results.NoContent();
+         });
+@@ -155,7 +166,7 @@
+         // Timeline: blogs by the current user's friends.
+         api.MapGet("/timeline", async (HttpContext ctx, AppDbContext db) =>
+         {
+-            if (CurrentUserId(ctx) is not { } uid) return Results.Unauthorized();
++            if (await CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
+             var friends = db.Friendships.Where(f => f.UserId == uid).Select(f => f.FriendId);
+             return Results.Ok(await ToViews(db, db.Blogs.Where(b => friends.Contains(b.AuthorId))
+                 .OrderByDescending(b => b.CreatedAt)));
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/backend/src/SecLab.Api/Program.cs sol03/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 10:48:32.898922484 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 11:08:04.554354531 +0200
+@@ -1,5 +1,6 @@
+ using Microsoft.EntityFrameworkCore;
+ using SecLab.Api.Data;
++using Microsoft.AspNetCore.Authentication.JwtBearer;
+ using Microsoft.AspNetCore.Identity;
+ using SecLab.Api.Endpoints;
+ using SecLab.Api.Models;
+@@ -10,6 +11,15 @@
+ builder.WebHost.ConfigureKestrel(k => k.ConfigureHttpsDefaults(h =>
+     h.SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13));
+ 
++builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(o =>
++{
++    o.Authority = builder.Configuration["Auth:Authority"];        // issuer + discovery document + signing keys
++    o.Audience = builder.Configuration["Auth:Audience"];          // this API must be the intended audience
++    o.MapInboundClaims = false;                                   // keep claim names as issued (sub, preferred_username)
++    o.RequireHttpsMetadata = !builder.Environment.IsDevelopment(); // dev Keycloak runs on plain HTTP; production IdPs never do
++    o.TokenValidationParameters.ClockSkew = TimeSpan.FromSeconds(30);   // default is 5 minutes!
++});
++builder.Services.AddAuthorization();
+ builder.Services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
+ builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
+ // WEAKNESS: wide-open CORS.
+@@ -24,6 +34,8 @@
+ if (!app.Environment.IsDevelopment()) app.UseHsts();   // browsers remember: HTTPS only (skipped on localhost by design)
+ app.UseHttpsRedirection();
+ app.UseCors();
++app.UseAuthentication();
++app.UseAuthorization();
+ app.UseStaticFiles();
+ 
+ using (var scope = app.Services.CreateScope())
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/backend/src/SecLab.Api/SecLab.Api.csproj sol03/backend/src/SecLab.Api/SecLab.Api.csproj
+--- a/backend/src/SecLab.Api/SecLab.Api.csproj	2026-09-30 10:48:32.898863645 +0200
++++ b/backend/src/SecLab.Api/SecLab.Api.csproj	2026-09-30 11:08:04.554251688 +0200
+@@ -5,6 +5,7 @@
+     <ImplicitUsings>enable</ImplicitUsings>
+   </PropertyGroup>
+   <ItemGroup>
++    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
+     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.0" />
+     <PackageReference Include="Microsoft.Extensions.Identity.Core" Version="10.0.0" />
+   </ItemGroup>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/frontend/package.json sol03/frontend/package.json
+--- a/frontend/package.json	2026-09-30 10:48:32.883621981 +0200
++++ b/frontend/package.json	2026-09-30 11:09:10.597153652 +0200
+@@ -10,6 +10,7 @@
+     "preview": "vite preview"
+   },
+   "dependencies": {
++    "oidc-client-ts": "^3.5.0",
+     "react": "^19.2.8",
+     "react-dom": "^19.2.8",
+     "react-router-dom": "^7.18.4"
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/frontend/package-lock.json sol03/frontend/package-lock.json
+--- a/frontend/package-lock.json	2026-09-30 10:48:32.883608896 +0200
++++ b/frontend/package-lock.json	2026-09-30 11:09:10.605153707 +0200
+@@ -8,6 +8,7 @@
+       "name": "frontend",
+       "version": "0.0.0",
+       "dependencies": {
++        "oidc-client-ts": "^3.5.0",
+         "react": "^19.2.8",
+         "react-dom": "^19.2.8",
+         "react-router-dom": "^7.18.4"
+@@ -782,6 +783,15 @@
+         "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+       }
+     },
++    "node_modules/jwt-decode": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/jwt-decode/-/jwt-decode-4.0.0.tgz",
++      "integrity": "sha512-+KJGIyHgkGuIq3IEBNftfhW/LfWhXUIY6OmyVWjliu5KH1y0fw7VQ8YndE2O4qZdMSd9SqbnC8GOcZEy0Om7sA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/lightningcss": {
+       "version": "1.33.0",
+       "resolved": "https://registry.npmjs.org/lightningcss/-/lightningcss-1.33.0.tgz",
+@@ -1074,6 +1084,18 @@
+         "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
+       }
+     },
++    "node_modules/oidc-client-ts": {
++      "version": "3.5.0",
++      "resolved": "https://registry.npmjs.org/oidc-client-ts/-/oidc-client-ts-3.5.0.tgz",
++      "integrity": "sha512-l2q8l9CTCTOlbX+AnK4p3M+4CEpKpyQhle6blQkdFhm0IsBqsxm15bYaSa11G7pWdsYr6epdsRZxJpCyCRbT8A==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "jwt-decode": "^4.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/oxlint": {
+       "version": "1.86.0",
+       "resolved": "https://registry.npmjs.org/oxlint/-/oxlint-1.86.0.tgz",
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/frontend/src/api/auth.ts sol03/frontend/src/api/auth.ts
+--- a/frontend/src/api/auth.ts	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/api/auth.ts	2026-09-30 11:09:10.738154636 +0200
+@@ -0,0 +1,14 @@
++import { UserManager, WebStorageStateStore } from 'oidc-client-ts'
++
++// Authorization Code flow with PKCE against Keycloak. The SPA is a *public* client: no client secret.
++export const userManager = new UserManager({
++  authority: 'http://localhost:8081/realms/seclab',
++  client_id: 'seclab-spa',
++  redirect_uri: `${window.location.origin}/callback`,
++  post_logout_redirect_uri: window.location.origin,
++  response_type: 'code',
++  scope: 'openid profile email',
++  // Tokens live in sessionStorage (gone when the tab closes). Still readable by any script running in the
++  // page (XSS) - see the token-storage discussion in docs/03; a BFF avoids it.
++  userStore: new WebStorageStateStore({ store: window.sessionStorage }),
++})
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/frontend/src/api/client.ts sol03/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-09-30 10:48:32.883522497 +0200
++++ b/frontend/src/api/client.ts	2026-09-30 11:09:10.754577855 +0200
+@@ -1,3 +1,5 @@
++import { userManager } from './auth'
++
+ // Single place for all HTTP calls. Later tutorial steps change auth, base URL and versioning here.
+ export const API_BASE = 'https://localhost:5443'
+ 
+@@ -10,22 +12,18 @@
+   title: string; body: string; createdAt: string; likes: number
+ }
+ 
+-// WEAKNESS: the "token" is just the user id and is kept in localStorage.
+-export const getToken = () => localStorage.getItem('token')
+-export const setSession = (token: string, user: User) => {
+-  localStorage.setItem('token', token)
+-  localStorage.setItem('user', JSON.stringify(user))
+-}
+-export const clearSession = () => { localStorage.removeItem('token'); localStorage.removeItem('user') }
++// The signed-in local user is cached for display only; authority is the access token, never this object.
++export const setSession = (user: User) => sessionStorage.setItem('me', JSON.stringify(user))
++export const clearSession = () => sessionStorage.removeItem('me')
+ export const currentUser = (): User | null => {
+-  const raw = localStorage.getItem('user')
++  const raw = sessionStorage.getItem('me')
+   return raw ? JSON.parse(raw) : null
+ }
+ 
+ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+   const headers = new Headers(init.headers)
+-  const token = getToken()
+-  if (token) headers.set('X-User-Id', token)
++  const oidcUser = await userManager.getUser()
++  if (oidcUser && !oidcUser.expired) headers.set('Authorization', `Bearer ${oidcUser.access_token}`)
+   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json')
+   const res = await fetch(API_BASE + path, { ...init, headers })
+   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+@@ -33,8 +31,7 @@
+ }
+ 
+ export const api = {
+-  login: (username: string, password: string) =>
+-    request<{ token: string; user: User }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
++  me: () => request<User>('/api/me'),
+   user: (id: number) => request<User>(`/api/users/${id}`),
+   updateUser: (id: number, u: User) => request<User>(`/api/users/${id}`, { method: 'PUT', body: JSON.stringify(u) }),
+   friends: (id: number) => request<User[]>(`/api/users/${id}/friends`),
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/frontend/src/App.tsx sol03/frontend/src/App.tsx
+--- a/frontend/src/App.tsx	2026-09-30 10:48:32.883566478 +0200
++++ b/frontend/src/App.tsx	2026-09-30 11:09:10.754711225 +0200
+@@ -1,17 +1,18 @@
+-import { BrowserRouter, NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
++import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom'
+ import Login from './pages/Login'
++import Callback from './pages/Callback'
+ import Profile from './pages/Profile'
+ import Personal from './pages/Personal'
+ import Timeline from './pages/Timeline'
+ import Experience from './pages/Experience'
+ import { clearSession, currentUser } from './api/client'
++import { userManager } from './api/auth'
+ 
+ function Guard({ children }: { children: React.ReactElement }) {
+   return currentUser() ? children : <Navigate to="/login" />
+ }
+ 
+ function Nav() {
+-  const nav = useNavigate()
+   const user = currentUser()
+   if (!user) return null
+   return (
+@@ -22,7 +23,7 @@
+       <NavLink to="/experience">Experience</NavLink>
+       <span className="spacer" />
+       <span>{user.displayName}</span>
+-      <button onClick={() => { clearSession(); nav('/login') }}>Log out</button>
++      <button onClick={async () => { clearSession(); await userManager.signoutRedirect() }}>Log out</button>
+     </nav>
+   )
+ }
+@@ -34,6 +35,7 @@
+       <main>
+         <Routes>
+           <Route path="/login" element={<Login />} />
++          <Route path="/callback" element={<Callback />} />
+           <Route path="/profile" element={<Guard><Profile /></Guard>} />
+           <Route path="/personal" element={<Guard><Personal /></Guard>} />
+           <Route path="/timeline" element={<Guard><Timeline /></Guard>} />
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/frontend/src/pages/Callback.tsx sol03/frontend/src/pages/Callback.tsx
+--- a/frontend/src/pages/Callback.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/pages/Callback.tsx	2026-09-30 11:09:10.740154650 +0200
+@@ -0,0 +1,15 @@
++import { useEffect } from 'react'
++import { useNavigate } from 'react-router-dom'
++import { api, setSession } from '../api/client'
++import { userManager } from '../api/auth'
++
++export default function Callback() {
++  const nav = useNavigate()
++  useEffect(() => {
++    userManager.signinRedirectCallback()
++      .then(() => api.me())
++      .then(me => { setSession(me); nav('/profile', { replace: true }) })
++      .catch(() => nav('/login', { replace: true }))
++  }, [nav])
++  return <p>Signing you in…</p>
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/frontend/src/pages/Login.tsx sol03/frontend/src/pages/Login.tsx
+--- a/frontend/src/pages/Login.tsx	2026-09-30 10:48:32.883540590 +0200
++++ b/frontend/src/pages/Login.tsx	2026-09-30 11:09:10.754664217 +0200
+@@ -1,30 +1,11 @@
+-import { useState } from 'react'
+-import { useNavigate } from 'react-router-dom'
+-import { api, setSession } from '../api/client'
++import { userManager } from '../api/auth'
+ 
+ export default function Login() {
+-  const [username, setUsername] = useState('alice')
+-  const [password, setPassword] = useState('password123')
+-  const [error, setError] = useState('')
+-  const nav = useNavigate()
+-
+-  const submit = async (e: React.FormEvent) => {
+-    e.preventDefault()
+-    try {
+-      const { token, user } = await api.login(username, password)
+-      setSession(token, user)
+-      nav('/profile')
+-    } catch { setError('Login failed') }
+-  }
+-
+   return (
+-    <form onSubmit={submit} className="card narrow">
++    <div className="card narrow">
+       <h2>Log in</h2>
+-      <input value={username} onChange={e => setUsername(e.target.value)} placeholder="Username" />
+-      <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" />
+-      <button>Log in</button>
+-      {error && <p className="error">{error}</p>}
++      <button onClick={() => userManager.signinRedirect()}>Log in with Keycloak</button>
+       <small>Seed users: alice, bob, carol, dave, eve — password123</small>
+-    </form>
++    </div>
+   )
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid03/frontend/src/pages/Profile.tsx sol03/frontend/src/pages/Profile.tsx
+--- a/frontend/src/pages/Profile.tsx	2026-09-30 10:48:32.883554676 +0200
++++ b/frontend/src/pages/Profile.tsx	2026-09-30 11:09:10.754647566 +0200
+@@ -1,5 +1,5 @@
+ import { useEffect, useState } from 'react'
+-import { api, API_BASE, currentUser, setSession, getToken, type User } from '../api/client'
++import { api, API_BASE, currentUser, setSession, type User } from '../api/client'
+ 
+ export default function Profile() {
+   const me = currentUser()!
+@@ -19,7 +19,7 @@
+ 
+   const save = async () => {
+     const updated = await api.updateUser(user.id, user)
+-    setSession(getToken()!, updated); setMsg('Saved')
++    setSession(updated); setMsg('Saved')
+   }
+   const upload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+     const file = e.target.files?.[0]; if (!file) return

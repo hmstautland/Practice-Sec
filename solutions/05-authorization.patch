@@ -1,0 +1,376 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid05/backend/src/SecLab.Api/Authorization/LocalUserClaims.cs sol05/backend/src/SecLab.Api/Authorization/LocalUserClaims.cs
+--- a/backend/src/SecLab.Api/Authorization/LocalUserClaims.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Authorization/LocalUserClaims.cs	2026-09-30 11:17:50.090432740 +0200
+@@ -0,0 +1,31 @@
++using System.Security.Claims;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.EntityFrameworkCore;
++using SecLab.Api.Data;
++
++namespace SecLab.Api.Authorization;
++
++/// <summary>
++/// The IdP proves *who* the caller is; what they may do is decided here, from our own database.
++/// Adds the local user id and the local role to the validated principal. Runs on every request and must be idempotent.
++/// </summary>
++public class LocalUserClaims(AppDbContext db) : IClaimsTransformation
++{
++    public const string LocalUserId = "local_user_id";
++
++    public async Task<ClaimsPrincipal> TransformAsync(ClaimsPrincipal principal)
++    {
++        if (principal.Identity is not ClaimsIdentity identity || !identity.IsAuthenticated || identity.HasClaim(c => c.Type == LocalUserId))
++            return principal;
++        var username = principal.FindFirst("preferred_username")?.Value;
++        if (string.IsNullOrEmpty(username)) return principal;
++
++        var user = await db.Users.Where(u => u.Username == username).Select(u => new { u.Id, u.Role }).FirstOrDefaultAsync();
++        if (user is null) return principal;
++
++        var clone = new ClaimsIdentity(identity);            // never mutate the identity the handler cached
++        clone.AddClaim(new Claim(LocalUserId, user.Id.ToString()));
++        clone.AddClaim(new Claim(ClaimTypes.Role, user.Role));
++        return new ClaimsPrincipal(clone);
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid05/backend/src/SecLab.Api/Authorization/ResourceHandlers.cs sol05/backend/src/SecLab.Api/Authorization/ResourceHandlers.cs
+--- a/backend/src/SecLab.Api/Authorization/ResourceHandlers.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Authorization/ResourceHandlers.cs	2026-09-30 11:17:50.091432755 +0200
+@@ -0,0 +1,61 @@
++using System.Security.Claims;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Authorization.Infrastructure;
++using Microsoft.EntityFrameworkCore;
++using SecLab.Api.Data;
++using SecLab.Api.Models;
++
++namespace SecLab.Api.Authorization;
++
++public static class Operations
++{
++    public static readonly OperationAuthorizationRequirement ViewFull = new() { Name = nameof(ViewFull) };       // owner or admin
++    public static readonly OperationAuthorizationRequirement ViewAsFriend = new() { Name = nameof(ViewAsFriend) }; // + friends
++    public static readonly OperationAuthorizationRequirement Edit = new() { Name = nameof(Edit) };
++    public static readonly OperationAuthorizationRequirement Delete = new() { Name = nameof(Delete) };
++}
++
++static class PrincipalExtensions
++{
++    public static int? LocalId(this ClaimsPrincipal p) =>
++        int.TryParse(p.FindFirst(LocalUserClaims.LocalUserId)?.Value, out var id) ? id : null;
++}
++
++/// <summary>Who may see/edit a user record? (object-level authorization)</summary>
++public class UserResourceHandler(AppDbContext db) : AuthorizationHandler<OperationAuthorizationRequirement, User>
++{
++    protected override async Task HandleRequirementAsync(AuthorizationHandlerContext ctx, OperationAuthorizationRequirement req, User target)
++    {
++        if (ctx.User.LocalId() is not { } me) return;                 // no local identity → no success → denied
++        var isOwner = me == target.Id;
++        var isAdmin = ctx.User.IsInRole("Admin");
++
++        var allowed = req.Name switch
++        {
++            nameof(Operations.ViewFull) => isOwner || isAdmin,
++            nameof(Operations.Edit) => isOwner,                        // not even admins edit other people's profiles
++            nameof(Operations.ViewAsFriend) => isOwner || isAdmin
++                || await db.Friendships.AnyAsync(f => f.UserId == target.Id && f.FriendId == me),
++            _ => false,
++        };
++        if (allowed) ctx.Succeed(req);
++    }
++}
++
++/// <summary>Who may change a blog?</summary>
++public class BlogResourceHandler : AuthorizationHandler<OperationAuthorizationRequirement, Blog>
++{
++    protected override Task HandleRequirementAsync(AuthorizationHandlerContext ctx, OperationAuthorizationRequirement req, Blog blog)
++    {
++        if (ctx.User.LocalId() is not { } me) return Task.CompletedTask;
++        var isAuthor = blog.AuthorId == me;
++        var allowed = req.Name switch
++        {
++            nameof(Operations.Edit) => isAuthor,
++            nameof(Operations.Delete) => isAuthor || ctx.User.IsInRole("Admin"),
++            _ => false,
++        };
++        if (allowed) ctx.Succeed(req);
++        return Task.CompletedTask;
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid05/backend/src/SecLab.Api/Endpoints/Api.cs sol05/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:13:29.384153191 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:17:56.527527646 +0200
+@@ -1,9 +1,12 @@
++using System.Security.Claims;
++using Microsoft.AspNetCore.Authorization;
+ using System.Security.Cryptography;
+ using System.Text;
+ using System.Text.RegularExpressions;
+ using Microsoft.AspNetCore.Identity;
+ using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Caching.Memory;
++using SecLab.Api.Authorization;
+ using SecLab.Api.Data;
+ using SecLab.Api.Models;
+ 
+@@ -23,7 +26,7 @@
+ 
+     public static void Map(WebApplication app)
+     {
+-        var api = app.MapGroup("/api").RequireAuthorization();          // authenticated by default
++        var api = app.MapGroup("/api");                                // authenticated by default: see the fallback policy in Program.cs
+         var auth = api.MapGroup("/auth").AllowAnonymous();            // legacy local login/registration stay public for now
+ 
+         // ---- Auth ----
+@@ -85,7 +88,7 @@
+         // The signed-in user, resolved from the token. Never returns the password column.
+         api.MapGet("/me", async (HttpContext ctx, AppDbContext db) =>
+             await CurrentUserId(ctx, db) is { } id
+-                ? Results.Ok(await db.Users.Where(u => u.Id == id).Select(u => new { u.Id, u.Username, u.DisplayName, u.Email, u.Phone, u.Address, u.AvatarUrl, u.Bio, u.Role }).FirstAsync())
++                ? Results.Ok(FullProfile.From(await db.Users.FirstAsync(u => u.Id == id)))
+                 : Results.Unauthorized());
+ 
+         Passkeys.Map(api);
+@@ -106,30 +109,47 @@
+         });
+ 
+         // ---- Profile ----
+-        // WEAKNESS: IDOR - any caller can read any user, including the Password column.
+-        api.MapGet("/users/{id:int}", async (int id, AppDbContext db) =>
+-            await db.Users.FindAsync(id) is { } u ? Results.Ok(u) : Results.NotFound());
++        api.MapGet("/users/{id:int}", async (int id, ClaimsPrincipal me, AppDbContext db, IAuthorizationService authz) =>
++        {
++            var target = await db.Users.FindAsync(id);
++            if (target is null) return Results.NotFound();
++            // Property-level authorization: the same record has three faces.
++            if ((await authz.AuthorizeAsync(me, target, Operations.ViewFull)).Succeeded) return Results.Ok(FullProfile.From(target));
++            if ((await authz.AuthorizeAsync(me, target, Operations.ViewAsFriend)).Succeeded) return Results.Ok(FriendProfile.From(target));
++            return Results.Ok(PublicProfile.From(target));
++        });
+ 
+-        // WEAKNESS: mass assignment - binds the full entity, so Role/Password/Id can be overwritten; no ownership check.
+-        api.MapPut("/users/{id:int}", async (int id, User update, AppDbContext db) =>
++        api.MapPut("/users/{id:int}", async (int id, UpdateProfile update, ClaimsPrincipal me, AppDbContext db, IAuthorizationService authz) =>
+         {
+             var user = await db.Users.FindAsync(id);
+             if (user is null) return Results.NotFound();
+-            update.Id = id;
+-            db.Entry(user).CurrentValues.SetValues(update);
++            if (!(await authz.AuthorizeAsync(me, user, Operations.Edit)).Succeeded) return Results.Forbid();
++            // Only these fields are editable. Role, Username, Password, Id are not even part of the input type.
++            user.DisplayName = update.DisplayName ?? user.DisplayName;
++            user.Email = update.Email ?? user.Email;
++            user.Phone = update.Phone ?? user.Phone;
++            user.Address = update.Address ?? user.Address;
++            user.Bio = update.Bio ?? user.Bio;
+             await db.SaveChangesAsync();
+-            return Results.Ok(user);
++            return Results.Ok(FullProfile.From(user));
+         });
+ 
+-        api.MapGet("/users/{id:int}/friends", async (int id, AppDbContext db) =>
+-            await db.Friendships.Where(f => f.UserId == id)
+-                .Join(db.Users, f => f.FriendId, u => u.Id, (f, u) => u).ToListAsync());
++        api.MapGet("/users/{id:int}/friends", async (int id, ClaimsPrincipal me, AppDbContext db, IAuthorizationService authz) =>
++        {
++            var owner = await db.Users.FindAsync(id);
++            if (owner is null) return Results.NotFound();
++            if (!(await authz.AuthorizeAsync(me, owner, Operations.ViewFull)).Succeeded) return Results.Forbid();
++            var friends = await db.Friendships.Where(f => f.UserId == id)
++                .Join(db.Users, f => f.FriendId, u => u.Id, (f, u) => u).ToListAsync();
++            return Results.Ok(friends.Select(FriendProfile.From));
++        });
+ 
+         // WEAKNESS: unrestricted upload - original file name, any type, any size, served from wwwroot.
+-        api.MapPost("/users/{id:int}/avatar", async (int id, IFormFile file, AppDbContext db, IWebHostEnvironment env) =>
++        api.MapPost("/users/{id:int}/avatar", async (int id, IFormFile file, ClaimsPrincipal me, AppDbContext db, IAuthorizationService authz, IWebHostEnvironment env) =>
+         {
+             var user = await db.Users.FindAsync(id);
+             if (user is null) return Results.NotFound();
++            if (!(await authz.AuthorizeAsync(me, user, Operations.Edit)).Succeeded) return Results.Forbid();
+             var dir = Path.Combine(env.WebRootPath, "avatars");
+             Directory.CreateDirectory(dir);
+             var path = Path.Combine(dir, file.FileName);
+@@ -139,6 +159,17 @@
+             return Results.Ok(new { user.AvatarUrl });
+         }).DisableAntiforgery();
+ 
++        // ---- Admin (policy-based) ----
++        var admin = api.MapGroup("/admin").RequireAuthorization("Admin");
++        admin.MapGet("/users", async (AppDbContext db) =>
++            await db.Users.Select(u => new { u.Id, u.Username, u.DisplayName, u.Email, u.Role }).ToListAsync());
++        admin.MapPut("/users/{id:int}/role", async (int id, ChangeRole req, AppDbContext db) =>
++        {
++            if (req.Role is not ("User" or "Admin")) return Results.ValidationProblem(new Dictionary<string, string[]> { ["role"] = ["must be User or Admin"] });
++            var updated = await db.Users.Where(u => u.Id == id).ExecuteUpdateAsync(s => s.SetProperty(u => u.Role, req.Role));
++            return updated == 0 ? Results.NotFound() : Results.NoContent();
++        });
++
+         // ---- Blogs ----
+         api.MapGet("/blogs", async (AppDbContext db) => await ToViews(db, db.Blogs.OrderByDescending(b => b.CreatedAt)));
+ 
+@@ -149,15 +180,37 @@
+             return await ToViews(db, db.Blogs.FromSqlRaw(sql));
+         });
+ 
+-        // WEAKNESS: no validation, AuthorId taken from the client body, Body stored/rendered as raw HTML (stored XSS).
+-        api.MapPost("/blogs", async (Blog blog, AppDbContext db) =>
++        // WEAKNESS: no validation, Body stored/rendered as raw HTML (stored XSS). The author is now the caller, never the body.
++        api.MapPost("/blogs", async (Blog blog, HttpContext ctx, AppDbContext db) =>
+         {
+-            blog.Id = 0; blog.CreatedAt = DateTime.UtcNow;
++            if (await CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
++            blog.Id = 0; blog.CreatedAt = DateTime.UtcNow; blog.AuthorId = uid;
+             db.Blogs.Add(blog);
+             await db.SaveChangesAsync();
+             return Results.Created($"/api/blogs/{blog.Id}", blog);
+         });
+ 
++        api.MapPut("/blogs/{id:int}", async (int id, EditBlog edit, ClaimsPrincipal me, AppDbContext db, IAuthorizationService authz) =>
++        {
++            var blog = await db.Blogs.FindAsync(id);
++            if (blog is null) return Results.NotFound();
++            if (!(await authz.AuthorizeAsync(me, blog, Operations.Edit)).Succeeded) return Results.Forbid();
++            blog.Title = edit.Title ?? blog.Title; blog.Body = edit.Body ?? blog.Body;
++            await db.SaveChangesAsync();
++            return Results.Ok(blog);
++        });
++
++        api.MapDelete("/blogs/{id:int}", async (int id, ClaimsPrincipal me, AppDbContext db, IAuthorizationService authz) =>
++        {
++            var blog = await db.Blogs.FindAsync(id);
++            if (blog is null) return Results.NotFound();
++            if (!(await authz.AuthorizeAsync(me, blog, Operations.Delete)).Succeeded) return Results.Forbid();
++            await db.BlogLikes.Where(l => l.BlogId == id).ExecuteDeleteAsync();
++            db.Blogs.Remove(blog);
++            await db.SaveChangesAsync();
++            return Results.NoContent();
++        });
++
+         api.MapPost("/blogs/{id:int}/like", async (int id, HttpContext ctx, AppDbContext db) =>
+         {
+             if (await CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
+@@ -176,10 +229,15 @@
+             return Results.NoContent();
+         });
+ 
+-        // Personal page: blogs the user has liked. WEAKNESS: any user id can be requested.
+-        api.MapGet("/users/{id:int}/likes", async (int id, AppDbContext db) =>
+-            await ToViews(db, db.Blogs.Where(b => db.BlogLikes.Any(l => l.UserId == id && l.BlogId == b.Id))
++        // Personal page: blogs the user has liked. Private to the owner (and admins).
++        api.MapGet("/users/{id:int}/likes", async (int id, ClaimsPrincipal me, AppDbContext db, IAuthorizationService authz) =>
++        {
++            var owner = await db.Users.FindAsync(id);
++            if (owner is null) return Results.NotFound();
++            if (!(await authz.AuthorizeAsync(me, owner, Operations.ViewFull)).Succeeded) return Results.Forbid();
++            return Results.Ok(await ToViews(db, db.Blogs.Where(b => db.BlogLikes.Any(l => l.UserId == id && l.BlogId == b.Id))
+                 .OrderByDescending(b => b.CreatedAt)));
++        });
+ 
+         // Timeline: blogs by the current user's friends.
+         api.MapGet("/timeline", async (HttpContext ctx, AppDbContext db) =>
+@@ -191,7 +249,7 @@
+         });
+ 
+         // WEAKNESS: crash endpoint used by the error-handling step; developer exception page leaks details.
+-        api.MapGet("/debug/crash", () => { throw new InvalidOperationException("Boom: connection string is " + "Server=localhost;User Id=sa;..."); });
++        api.MapGet("/debug/crash", () => { throw new InvalidOperationException("Boom: connection string is " + "Server=localhost;User Id=sa;..."); }).RequireAuthorization("Admin");
+     }
+ 
+     public record BlogView(int Id, int AuthorId, string AuthorName, string AuthorAvatar, string Title, string Body, DateTime CreatedAt, int Likes);
+@@ -204,6 +262,16 @@
+             b.Title, b.Body, b.CreatedAt,
+             db.BlogLikes.Count(l => l.BlogId == b.Id))).ToListAsync();
+ 
++    // What each audience may see of a user. Entities never leave the API.
++    public record PublicProfile(int Id, string Username, string DisplayName, string AvatarUrl, string Bio)
++    { public static PublicProfile From(User u) => new(u.Id, u.Username, u.DisplayName, u.AvatarUrl, u.Bio); }
++    public record FriendProfile(int Id, string Username, string DisplayName, string AvatarUrl, string Bio, string Email, string Phone)
++    { public static FriendProfile From(User u) => new(u.Id, u.Username, u.DisplayName, u.AvatarUrl, u.Bio, u.Email, u.Phone); }
++    public record FullProfile(int Id, string Username, string DisplayName, string AvatarUrl, string Bio, string Email, string Phone, string Address, string Role)
++    { public static FullProfile From(User u) => new(u.Id, u.Username, u.DisplayName, u.AvatarUrl, u.Bio, u.Email, u.Phone, u.Address, u.Role); }
++    public record UpdateProfile(string? DisplayName, string? Email, string? Phone, string? Address, string? Bio);
++    public record EditBlog(string? Title, string? Body);
++    public record ChangeRole(string? Role);
+     public record LoginRequest(string Username, string Password);
+     public record RegisterRequest(string? Username, string? Password, string? DisplayName, string? Email);
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid05/backend/src/SecLab.Api/Program.cs sol05/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 11:13:29.384121591 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 11:17:50.107044717 +0200
+@@ -1,6 +1,9 @@
+ using Microsoft.EntityFrameworkCore;
+ using SecLab.Api.Data;
++using Microsoft.AspNetCore.Authentication;
+ using Microsoft.AspNetCore.Authentication.JwtBearer;
++using Microsoft.AspNetCore.Authorization;
++using SecLab.Api.Authorization;
+ using Microsoft.AspNetCore.Identity;
+ using SecLab.Api.Endpoints;
+ using SecLab.Api.Models;
+@@ -19,7 +22,12 @@
+     o.RequireHttpsMetadata = !builder.Environment.IsDevelopment(); // dev Keycloak runs on plain HTTP; production IdPs never do
+     o.TokenValidationParameters.ClockSkew = TimeSpan.FromSeconds(30);   // default is 5 minutes!
+ });
+-builder.Services.AddAuthorization();
++builder.Services.AddAuthorizationBuilder()
++    .SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build())   // default deny: an endpoint that forgets [Authorize] is still protected
++    .AddPolicy("Admin", p => p.RequireRole("Admin"));
++builder.Services.AddScoped<IClaimsTransformation, LocalUserClaims>();
++builder.Services.AddScoped<IAuthorizationHandler, UserResourceHandler>();
++builder.Services.AddScoped<IAuthorizationHandler, BlogResourceHandler>();
+ builder.Services.AddMemoryCache();
+ builder.Services.AddFido2(o =>
+ {
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid05/frontend/src/api/client.ts sol05/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-09-30 11:14:37.823711063 +0200
++++ b/frontend/src/api/client.ts	2026-09-30 11:19:09.424188750 +0200
+@@ -51,6 +51,7 @@
+   assertComplete: (assertion: unknown) => request<{ stepUpToken: string }>('/api/passkeys/assert/complete', { method: 'POST', body: JSON.stringify(assertion) }),
+   deleteAccount: (stepUpToken: string) => request<void>('/api/me', { method: 'DELETE', headers: { 'X-StepUp': stepUpToken } }),
+   timeline: () => request<Blog[]>('/api/timeline'),
++  deleteBlog: (blogId: number) => request<void>(`/api/blogs/${blogId}`, { method: 'DELETE' }),
+   like: (blogId: number) => request<void>(`/api/blogs/${blogId}/like`, { method: 'POST' }),
+   unlike: (blogId: number) => request<void>(`/api/blogs/${blogId}/like`, { method: 'DELETE' }),
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid05/frontend/src/BlogCard.tsx sol05/frontend/src/BlogCard.tsx
+--- a/frontend/src/BlogCard.tsx	2026-09-30 11:13:29.375594285 +0200
++++ b/frontend/src/BlogCard.tsx	2026-09-30 11:19:09.424158103 +0200
+@@ -1,6 +1,6 @@
+ import { API_BASE, type Blog } from './api/client'
+ 
+-export default function BlogCard({ blog, onLike }: { blog: Blog; onLike?: (b: Blog) => void }) {
++export default function BlogCard({ blog, onLike, onDelete }: { blog: Blog; onLike?: (b: Blog) => void; onDelete?: (b: Blog) => void }) {
+   return (
+     <article className="card">
+       <header className="author">
+@@ -12,7 +12,7 @@
+       {/* WEAKNESS: renders raw HTML from the database (stored XSS). */}
+       <div dangerouslySetInnerHTML={{ __html: blog.body }} />
+       <footer>
+-        ♥ {blog.likes} {onLike && <button onClick={() => onLike(blog)}>Like</button>}
++        ♥ {blog.likes} {onLike && <button onClick={() => onLike(blog)}>Like</button>} {onDelete && <button onClick={() => onDelete(blog)}>Delete</button>}
+       </footer>
+     </article>
+   )
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid05/frontend/src/pages/Experience.tsx sol05/frontend/src/pages/Experience.tsx
+--- a/frontend/src/pages/Experience.tsx	2026-09-30 11:13:29.375567604 +0200
++++ b/frontend/src/pages/Experience.tsx	2026-09-30 11:19:09.424208458 +0200
+@@ -12,6 +12,7 @@
+   const load = () => (q ? api.search(q) : api.blogs()).then(setBlogs)
+   useEffect(() => { load() }, [])
+   const like = async (b: Blog) => { await api.like(b.id); load() }
++  const remove = async (b: Blog) => { await api.deleteBlog(b.id); load() }
+   const create = async (e: React.FormEvent) => {
+     e.preventDefault()
+     await api.createBlog(me.id, title, body)
+@@ -30,7 +31,7 @@
+         <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search blogs" />
+         <button onClick={load}>Search</button>
+       </div>
+-      {blogs.map(b => <BlogCard key={b.id} blog={b} onLike={like} />)}
++      {blogs.map(b => <BlogCard key={b.id} blog={b} onLike={like} onDelete={b.authorId === me.id ? remove : undefined} />)}
+     </div>
+   )
+ }

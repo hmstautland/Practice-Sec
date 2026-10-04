@@ -1,0 +1,184 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid08/backend/src/SecLab.Api/appsettings.json sol08/backend/src/SecLab.Api/appsettings.json
+--- a/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:26:45.088134242 +0200
++++ b/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:31:47.495388590 +0200
+@@ -23,6 +23,9 @@
+   "Proxy": {
+     "KnownProxies": []
+   },
++  "Api": {
++    "V1SunsetDate": "2027-06-30"
++  },
+   "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } },
+   "AllowedHosts": "*"
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid08/backend/src/SecLab.Api/Endpoints/Api.cs sol08/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:26:45.088116740 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:32:01.093877974 +0200
+@@ -1,4 +1,5 @@
+ using System.Security.Claims;
++using Asp.Versioning;
+ using Microsoft.AspNetCore.Authorization;
+ using System.Security.Cryptography;
+ using System.Text;
+@@ -27,7 +28,8 @@
+ 
+     public static void Map(WebApplication app)
+     {
+-        var api = app.MapGroup("/api");                                // authenticated by default: see the fallback policy in Program.cs
++        var versions = app.NewApiVersionSet().HasDeprecatedApiVersion(new ApiVersion(1, 0)).HasApiVersion(new ApiVersion(2, 0)).ReportApiVersions().Build();
++        var api = app.MapGroup("/api").WithApiVersionSet(versions);                                // authenticated by default: see the fallback policy in Program.cs
+         var auth = api.MapGroup("/auth").AllowAnonymous().RequireRateLimiting(RateLimiting.RateLimiting.LoginPolicy);            // legacy local login/registration stay public for now
+ 
+         // ---- Auth ----
+@@ -173,7 +175,23 @@
+         });
+ 
+         // ---- Blogs ----
+-        api.MapGet("/blogs", async (AppDbContext db) => await ToViews(db, db.Blogs.OrderByDescending(b => b.CreatedAt)));
++        // v1: the whole table as a bare array (unbounded - one of the reasons v1 is being retired).
++        api.MapGet("/blogs", async (AppDbContext db) => await ToViews(db, db.Blogs.OrderByDescending(b => b.CreatedAt)))
++            .MapToApiVersion(1, 0);
++
++        // v2: bounded pages in an envelope.
++        api.MapGet("/blogs", async (AppDbContext db, int page = 1, int pageSize = 20) =>
++        {
++            var errors = new Dictionary<string, string[]>();
++            if (page < 1) errors["page"] = ["must be >= 1"];
++            if (pageSize is < 1 or > 50) errors["pageSize"] = ["must be between 1 and 50"];
++            if (errors.Count > 0) return Results.ValidationProblem(errors);
++
++            var total = await db.Blogs.CountAsync();
++            var skip = (long)(page - 1) * pageSize;
++            var items = skip > total ? [] : await ToViews(db, db.Blogs.OrderByDescending(b => b.CreatedAt).Skip((int)skip).Take(pageSize));
++            return Results.Ok(new { items, page, pageSize, total });
++        }).MapToApiVersion(2, 0);
+ 
+         // WEAKNESS: SQL injection - user input concatenated into raw SQL.
+         api.MapGet("/blogs/search", async (string q, AppDbContext db) =>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid08/backend/src/SecLab.Api/Program.cs sol08/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 11:27:28.077938592 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 11:33:46.113937497 +0200
+@@ -1,5 +1,6 @@
+ using Microsoft.EntityFrameworkCore;
+ using SecLab.Api.Data;
++using Asp.Versioning;
+ using Microsoft.AspNetCore.Authentication;
+ using Microsoft.AspNetCore.Authentication.JwtBearer;
+ using Microsoft.AspNetCore.Authorization;
+@@ -32,6 +33,17 @@
+ builder.Services.AddScoped<IClaimsTransformation, LocalUserClaims>();
+ builder.Services.AddScoped<IAuthorizationHandler, UserResourceHandler>();
+ builder.Services.AddScoped<IAuthorizationHandler, BlogResourceHandler>();
++var v1Sunset = DateTimeOffset.Parse(builder.Configuration["Api:V1SunsetDate"] ?? "2027-06-30", System.Globalization.CultureInfo.InvariantCulture,
++    System.Globalization.DateTimeStyles.AssumeUniversal);
++builder.Services.AddProblemDetails();
++builder.Services.AddApiVersioning(o =>
++{
++    o.DefaultApiVersion = new ApiVersion(1, 0);
++    o.AssumeDefaultVersionWhenUnspecified = true;                 // legacy clients keep working - until the sunset date
++    o.ReportApiVersions = true;                                   // api-supported-versions / api-deprecated-versions
++    o.ApiVersionReader = ApiVersionReader.Combine(new HeaderApiVersionReader("api-version"), new QueryStringApiVersionReader("api-version"));
++    o.Policies.Sunset(1.0).Effective(v1Sunset).Link("docs/08-api-versioning.md").Title("Migrate to API v2").Type("text/markdown");
++});
+ builder.Services.AddMemoryCache();
+ builder.Services.AddSecLabRateLimiting(builder.Configuration);
+ builder.Services.AddFido2(o =>
+@@ -55,6 +67,25 @@
+ if (!app.Environment.IsDevelopment()) app.UseHsts();   // browsers remember: HTTPS only (skipped on localhost by design)
+ app.UseHttpsRedirection();
+ app.UseCors();
++app.Use(async (ctx, next) =>
++{
++    // Retire old versions for real: deprecation signal now, 410 Gone after the sunset date.
++    ApiVersion? requested;
++    try { requested = ctx.Features.Get<IApiVersioningFeature>()?.RequestedApiVersion; }
++    catch (AmbiguousApiVersionException) { await next(); return; }   // contradicting versions: let the versioning layer answer 400
++    if (requested is { MajorVersion: 1 })
++    {
++        ctx.Response.Headers["Deprecation"] = "true";
++        if (DateTimeOffset.UtcNow >= v1Sunset)
++        {
++            ctx.Response.StatusCode = StatusCodes.Status410Gone;
++            await ctx.Response.WriteAsJsonAsync(new Microsoft.AspNetCore.Mvc.ProblemDetails { Status = 410, Title = "API version retired", Detail = "Use api-version 2.0." },
++                options: null, contentType: "application/problem+json");
++            return;
++        }
++    }
++    await next();
++});
+ app.UseAuthentication();
+ app.UseApiKeyPreAuthentication();
+ app.UseRateLimiter();                      // after authentication: the limiter needs to know who is calling
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid08/backend/src/SecLab.Api/SecLab.Api.csproj sol08/backend/src/SecLab.Api/SecLab.Api.csproj
+--- a/backend/src/SecLab.Api/SecLab.Api.csproj	2026-09-30 11:26:45.077792627 +0200
++++ b/backend/src/SecLab.Api/SecLab.Api.csproj	2026-09-30 11:31:47.495331734 +0200
+@@ -6,6 +6,7 @@
+   </PropertyGroup>
+   <ItemGroup>
+     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
++    <PackageReference Include="Asp.Versioning.Http" Version="10.2.3" />
+     <PackageReference Include="Fido2.AspNet" Version="4.1.1" />
+     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.0" />
+     <PackageReference Include="Microsoft.Extensions.Identity.Core" Version="10.0.0" />
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid08/frontend/src/api/client.ts sol08/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-09-30 11:28:07.295962951 +0200
++++ b/frontend/src/api/client.ts	2026-09-30 11:33:21.565028460 +0200
+@@ -1,6 +1,7 @@
+ import { userManager } from './auth'
+ 
+ // Single place for all HTTP calls. Later tutorial steps change auth, base URL and versioning here.
++export const API_VERSION = '2.0'
+ export const API_BASE = 'https://localhost:5443'
+ 
+ export interface User {
+@@ -22,6 +23,7 @@
+ 
+ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+   const headers = new Headers(init.headers)
++  headers.set('api-version', API_VERSION)          // always say which contract we speak
+   const oidcUser = await userManager.getUser()
+   if (oidcUser && !oidcUser.expired) headers.set('Authorization', `Bearer ${oidcUser.access_token}`)
+   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json')
+@@ -43,7 +45,7 @@
+     const fd = new FormData(); fd.append('file', file)
+     return request<{ avatarUrl: string }>(`/api/users/${id}/avatar`, { method: 'POST', body: fd })
+   },
+-  blogs: () => request<Blog[]>('/api/blogs'),
++  blogs: (page = 1, pageSize = 10) => request<{ items: Blog[]; page: number; pageSize: number; total: number }>(`/api/blogs?page=${page}&pageSize=${pageSize}`),
+   search: (q: string) => request<Blog[]>(`/api/blogs/search?q=${encodeURIComponent(q)}`),
+   createBlog: (authorId: number, title: string, body: string) =>
+     request<Blog>('/api/blogs', { method: 'POST', body: JSON.stringify({ authorId, title, body }) }),
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid08/frontend/src/pages/Experience.tsx sol08/frontend/src/pages/Experience.tsx
+--- a/frontend/src/pages/Experience.tsx	2026-09-30 11:26:45.078096325 +0200
++++ b/frontend/src/pages/Experience.tsx	2026-09-30 11:33:21.569902995 +0200
+@@ -5,11 +5,17 @@
+ export default function Experience() {
+   const me = currentUser()!
+   const [blogs, setBlogs] = useState<Blog[]>([])
++  const [page, setPage] = useState(1)
++  const [total, setTotal] = useState(0)
+   const [q, setQ] = useState('')
+   const [title, setTitle] = useState('')
+   const [body, setBody] = useState('')
+ 
+-  const load = () => (q ? api.search(q) : api.blogs()).then(setBlogs)
++  const load = async (nextPage = 1) => {
++    if (q) { setBlogs(await api.search(q)); setTotal(0); return }
++    const res = await api.blogs(nextPage)
++    setBlogs(nextPage === 1 ? res.items : [...blogs, ...res.items]); setPage(nextPage); setTotal(res.total)
++  }
+   useEffect(() => { load() }, [])
+   const like = async (b: Blog) => { await api.like(b.id); load() }
+   const remove = async (b: Blog) => { await api.deleteBlog(b.id); load() }
+@@ -29,9 +35,10 @@
+       </form>
+       <div className="search">
+         <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search blogs" />
+-        <button onClick={load}>Search</button>
++        <button onClick={() => load()}>Search</button>
+       </div>
+       {blogs.map(b => <BlogCard key={b.id} blog={b} onLike={like} onDelete={b.authorId === me.id ? remove : undefined} />)}
++      {!q && blogs.length < total && <button onClick={() => load(page + 1)}>Load more</button>}
+     </div>
+   )
+ }

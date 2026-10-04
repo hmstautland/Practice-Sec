@@ -1,0 +1,306 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid09/backend/src/SecLab.Api/appsettings.json sol09/backend/src/SecLab.Api/appsettings.json
+--- a/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:31:47.495388590 +0200
++++ b/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:45:16.383083921 +0200
+@@ -27,5 +27,14 @@
+     "V1SunsetDate": "2027-06-30"
+   },
+   "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } },
+-  "AllowedHosts": "*"
++  "AllowedHosts": "localhost;seclab.example",
++  "Cors": {
++    "AllowedOrigins": [ "https://localhost:5173" ]
++  },
++  "Admin": {
++    "AllowedNetworks": [ "127.0.0.1/32", "::1/128" ]
++  },
++  "Outbound": {
++    "AllowedHosts": [ "example.com" ]
++  }
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid09/backend/src/SecLab.Api/Endpoints/Api.cs sol09/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:32:01.093877974 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:45:27.774568081 +0200
+@@ -95,6 +95,7 @@
+                 : Results.Unauthorized());
+ 
+         Passkeys.Map(api);
++        Tools.Map(api, app.Configuration);
+         ApiKeys.Map(api);
+ 
+         // Deleting an account is destructive: it needs a fresh passkey assertion (step-up), not just a valid session.
+@@ -148,17 +149,30 @@
+             return Results.Ok(friends.Select(FriendProfile.From));
+         });
+ 
+-        // WEAKNESS: unrestricted upload - original file name, any type, any size, served from wwwroot.
++        // Avatars: allow-list of real image types decided from the CONTENT; the client's file name and content type are ignored.
+         api.MapPost("/users/{id:int}/avatar", async (int id, IFormFile file, ClaimsPrincipal me, AppDbContext db, IAuthorizationService authz, IWebHostEnvironment env) =>
+         {
+             var user = await db.Users.FindAsync(id);
+             if (user is null) return Results.NotFound();
+             if (!(await authz.AuthorizeAsync(me, user, Operations.Edit)).Succeeded) return Results.Forbid();
++
++            const int MaxAvatarBytes = 2 * 1024 * 1024;
++            if (file.Length is 0 or > MaxAvatarBytes) return Results.ValidationProblem(new Dictionary<string, string[]> { ["file"] = ["1 byte to 2 MB"] });
++            var head = new byte[12];
++            await using var input = file.OpenReadStream();
++            var read = await input.ReadAtLeastAsync(head, head.Length, throwOnEndOfStream: false);
++            var ext = ImageType.Detect(head.AsSpan(0, read));
++            if (ext is null) return Results.ValidationProblem(new Dictionary<string, string[]> { ["file"] = ["only PNG, JPEG or WebP images"] });
++
+             var dir = Path.Combine(env.WebRootPath, "avatars");
+             Directory.CreateDirectory(dir);
+-            var path = Path.Combine(dir, file.FileName);
+-            await using (var fs = File.Create(path)) await file.CopyToAsync(fs);
+-            user.AvatarUrl = $"/avatars/{file.FileName}";
++            var name = Guid.NewGuid().ToString("N") + ext;                   // server-generated: no traversal, no overwrite, no double extensions
++            await using (var fs = new FileStream(Path.Combine(dir, name), FileMode.CreateNew))
++            {
++                await fs.WriteAsync(head.AsMemory(0, read));
++                await input.CopyToAsync(fs);
++            }
++            user.AvatarUrl = $"/avatars/{name}";
+             await db.SaveChangesAsync();
+             return Results.Ok(new { user.AvatarUrl });
+         }).DisableAntiforgery();
+@@ -292,6 +306,17 @@
+     public record UpdateProfile(string? DisplayName, string? Email, string? Phone, string? Address, string? Bio);
+     public record EditBlog(string? Title, string? Body);
+     public record ChangeRole(string? Role);
++    static class ImageType
++    {
++        public static string? Detect(ReadOnlySpan<byte> h)
++        {
++            if (h.Length >= 8 && h[..8].SequenceEqual(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })) return ".png";
++            if (h.Length >= 3 && h[0] == 0xFF && h[1] == 0xD8 && h[2] == 0xFF) return ".jpg";
++            if (h.Length >= 12 && h[..4].SequenceEqual("RIFF"u8) && h[8..12].SequenceEqual("WEBP"u8)) return ".webp";
++            return null;                                                   // SVG, HTML, GIF, executables ... all refused
++        }
++    }
++
+     public record LoginRequest(string Username, string Password);
+     public record RegisterRequest(string? Username, string? Password, string? DisplayName, string? Email);
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid09/backend/src/SecLab.Api/Endpoints/Tools.cs sol09/backend/src/SecLab.Api/Endpoints/Tools.cs
+--- a/backend/src/SecLab.Api/Endpoints/Tools.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Endpoints/Tools.cs	2026-09-30 11:45:16.374547090 +0200
+@@ -0,0 +1,54 @@
++using System.Net;
++using System.Text;
++using System.Text.RegularExpressions;
++using SecLab.Api.Security;
++
++namespace SecLab.Api.Endpoints;
++
++public static partial class Tools
++{
++    const int MaxBytes = 1024 * 1024;
++
++    [GeneratedRegex("<title[^>]*>(.*?)</title>", RegexOptions.IgnoreCase | RegexOptions.Singleline, matchTimeoutMilliseconds: 500)]
++    private static partial Regex TitleRegex();
++
++    public static void Map(RouteGroupBuilder api, IConfiguration config)
++    {
++        var allowed = config.GetSection("Outbound:AllowedHosts").Get<string[]>() ?? [];
++
++        api.MapPost("/tools/link-preview", async (LinkPreviewRequest req, IHttpClientFactory clients, CancellationToken ct) =>
++        {
++            if (!OutboundUrlPolicy.TryValidate(req.Url, allowed, out var uri))
++                return Results.ValidationProblem(new Dictionary<string, string[]> { ["url"] = ["URL is not allowed"] });
++
++            try
++            {
++                using var response = await clients.CreateClient("outbound").GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, ct);
++                if (response.StatusCode is >= HttpStatusCode.MultipleChoices and < HttpStatusCode.BadRequest)
++                    return Results.Problem("The site redirected; redirects are not followed.", statusCode: StatusCodes.Status502BadGateway);
++                if (!response.IsSuccessStatusCode) return Results.Problem("The site did not answer successfully.", statusCode: StatusCodes.Status502BadGateway);
++
++                await using var stream = await response.Content.ReadAsStreamAsync(ct);
++                var buffer = new byte[MaxBytes + 1];
++                var read = 0;
++                while (read < buffer.Length)
++                {
++                    var n = await stream.ReadAsync(buffer.AsMemory(read), ct);
++                    if (n == 0) break;
++                    read += n;
++                }
++                if (read > MaxBytes) return Results.Problem("The response is too large.", statusCode: StatusCodes.Status502BadGateway);
++
++                var m = TitleRegex().Match(Encoding.UTF8.GetString(buffer, 0, read));
++                var title = m.Success ? Regex.Replace(WebUtility.HtmlDecode(m.Groups[1].Value), @"\s+", " ").Trim() : null;
++                return Results.Ok(new { url = uri!.ToString(), title });
++            }
++            catch (Exception e) when (e is HttpRequestException or TaskCanceledException)
++            {
++                return Results.Problem("The site could not be reached.", statusCode: StatusCodes.Status502BadGateway);
++            }
++        });
++    }
++
++    public record LinkPreviewRequest(string? Url);
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid09/backend/src/SecLab.Api/Program.cs sol09/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 11:33:46.113937497 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 11:46:27.934261098 +0200
+@@ -6,6 +6,7 @@
+ using Microsoft.AspNetCore.Authorization;
+ using SecLab.Api.Authorization;
+ using SecLab.Api.RateLimiting;
++using SecLab.Api.Security;
+ using Microsoft.AspNetCore.Identity;
+ using SecLab.Api.Endpoints;
+ using SecLab.Api.Models;
+@@ -13,8 +14,11 @@
+ var builder = WebApplication.CreateBuilder(args);
+ 
+ // Only allow modern TLS on every HTTPS endpoint Kestrel opens.
+-builder.WebHost.ConfigureKestrel(k => k.ConfigureHttpsDefaults(h =>
+-    h.SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13));
++builder.WebHost.ConfigureKestrel(k =>
++{
++    k.ConfigureHttpsDefaults(h => h.SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13);
++    k.Limits.MaxRequestBodySize = 3 * 1024 * 1024;     // nothing in this API needs bigger requests (avatars are capped at 2 MB)
++});
+ 
+ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+     .AddScheme<AuthenticationSchemeOptions, ApiKeyAuthHandler>(ApiKeyDefaults.Scheme, null)
+@@ -28,7 +32,7 @@
+ });
+ builder.Services.AddAuthorizationBuilder()
+     .SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build())   // default deny: an endpoint that forgets [Authorize] is still protected
+-    .AddPolicy("Admin", p => p.RequireRole("Admin"))
++    .AddPolicy("Admin", p => p.RequireRole("Admin").AddRequirements(new AdminNetworkRequirement()))
+     .AddApiKeyPolicies();
+ builder.Services.AddScoped<IClaimsTransformation, LocalUserClaims>();
+ builder.Services.AddScoped<IAuthorizationHandler, UserResourceHandler>();
+@@ -54,8 +58,22 @@
+ });
+ builder.Services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
+ builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
+-// WEAKNESS: wide-open CORS.
+-builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
++// CORS allow-list: exact origins, methods and headers - nothing is "any".
++var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
++builder.Services.AddCors(o => o.AddDefaultPolicy(p => p
++    .WithOrigins(allowedOrigins)
++    .WithMethods("GET", "POST", "PUT", "DELETE")
++    .WithHeaders("Authorization", "Content-Type", "api-version", "X-StepUp")            // note: no X-Api-Key - keys are for servers, not browsers
++    .WithExposedHeaders("Retry-After", "Sunset", "Deprecation", "api-supported-versions", "api-deprecated-versions")
++    .SetPreflightMaxAge(TimeSpan.FromMinutes(10))));
++
++// The only place this API is allowed to call out to: a named client with no redirects, short timeout, and a connect-time address check.
++builder.Services.AddHttpClient("outbound", c => c.Timeout = TimeSpan.FromSeconds(5))
++    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
++    {
++        AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(3), ConnectCallback = OutboundUrlPolicy.SafeConnect,
++    });
++builder.Services.AddSingleton<IAuthorizationHandler, AdminNetworkHandler>();
+ 
+ builder.Services.AddHsts(o => { o.MaxAge = TimeSpan.FromDays(365); o.IncludeSubDomains = true; });
+ 
+@@ -66,6 +84,12 @@
+ app.UseDeveloperExceptionPage();
+ if (!app.Environment.IsDevelopment()) app.UseHsts();   // browsers remember: HTTPS only (skipped on localhost by design)
+ app.UseHttpsRedirection();
++app.Use((ctx, next) =>
++{
++    // With a single allowed origin ASP.NET Core does not add "Vary: Origin", but the answer still depends on the request's Origin.
++    ctx.Response.OnStarting(() => { ctx.Response.Headers.Append("Vary", "Origin"); return Task.CompletedTask; });
++    return next();
++});
+ app.UseCors();
+ app.Use(async (ctx, next) =>
+ {
+@@ -90,7 +114,14 @@
+ app.UseApiKeyPreAuthentication();
+ app.UseRateLimiter();                      // after authentication: the limiter needs to know who is calling
+ app.UseAuthorization();
+-app.UseStaticFiles();
++app.UseStaticFiles(new StaticFileOptions
++{
++    OnPrepareResponse = ctx =>
++    {
++        ctx.Context.Response.Headers["X-Content-Type-Options"] = "nosniff";                  // never let a browser guess "it's HTML"
++        ctx.Context.Response.Headers["Content-Security-Policy"] = "default-src 'none'; sandbox";
++    },
++});
+ 
+ using (var scope = app.Services.CreateScope())
+     Seed.Run(scope.ServiceProvider.GetRequiredService<AppDbContext>(), scope.ServiceProvider.GetRequiredService<IPasswordHasher<User>>());
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid09/backend/src/SecLab.Api/Security/AdminNetwork.cs sol09/backend/src/SecLab.Api/Security/AdminNetwork.cs
+--- a/backend/src/SecLab.Api/Security/AdminNetwork.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Security/AdminNetwork.cs	2026-09-30 11:45:16.372582789 +0200
+@@ -0,0 +1,21 @@
++using System.Net;
++using Microsoft.AspNetCore.Authorization;
++
++namespace SecLab.Api.Security;
++
++/// <summary>Admin functions are reachable only from listed networks (CIDR), in addition to the Admin role.</summary>
++public class AdminNetworkRequirement : IAuthorizationRequirement;
++
++public class AdminNetworkHandler(IConfiguration config) : AuthorizationHandler<AdminNetworkRequirement>
++{
++    readonly IPNetwork[] _networks = (config.GetSection("Admin:AllowedNetworks").Get<string[]>() ?? []).Select(IPNetwork.Parse).ToArray();
++
++    protected override Task HandleRequirementAsync(AuthorizationHandlerContext context, AdminNetworkRequirement requirement)
++    {
++        var ip = (context.Resource as HttpContext)?.Connection.RemoteIpAddress;
++        if (ip is null) return Task.CompletedTask;                       // unknown origin: deny
++        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();                  // ::ffff:127.0.0.1 == 127.0.0.1
++        if (_networks.Any(n => n.Contains(ip))) context.Succeed(requirement);
++        return Task.CompletedTask;
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid09/backend/src/SecLab.Api/Security/OutboundUrlPolicy.cs sol09/backend/src/SecLab.Api/Security/OutboundUrlPolicy.cs
+--- a/backend/src/SecLab.Api/Security/OutboundUrlPolicy.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Security/OutboundUrlPolicy.cs	2026-09-30 11:45:16.372848742 +0200
+@@ -0,0 +1,45 @@
++using System.Net;
++using System.Net.Sockets;
++
++namespace SecLab.Api.Security;
++
++/// <summary>Server-side requests only go where we say. Validate the URL string here, and the resolved address at connect time.</summary>
++public static class OutboundUrlPolicy
++{
++    public static bool TryValidate(string? raw, IReadOnlyCollection<string> allowedHosts, out Uri? uri)
++    {
++        uri = null;
++        if (string.IsNullOrWhiteSpace(raw) || raw.Length > 2048) return false;
++        if (!Uri.TryCreate(raw, UriKind.Absolute, out var u)) return false;
++        if (u.Scheme != Uri.UriSchemeHttps) return false;                          // no http, file, gopher, ...
++        if (!string.IsNullOrEmpty(u.UserInfo)) return false;                       // https://good.example@evil.example/
++        if (!u.IsDefaultPort) return false;                                        // only 443
++        if (u.HostNameType != UriHostNameType.Dns) return false;                   // no IP literals of any kind
++        if (!allowedHosts.Contains(u.IdnHost, StringComparer.OrdinalIgnoreCase)) return false;   // exact host, never "ends with" / "contains"
++        uri = u;
++        return true;
++    }
++
++    /// <summary>Second line of defence against DNS tricks: refuse to connect to non-public addresses.</summary>
++    public static bool IsPublic(IPAddress ip)
++    {
++        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
++        if (IPAddress.IsLoopback(ip) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any) || ip.Equals(IPAddress.None)) return false;
++        if (ip.AddressFamily == AddressFamily.InterNetworkV6)
++            return !(ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal || ip.IsIPv6Multicast || ip.IsIPv6UniqueLocal);
++        var b = ip.GetAddressBytes();
++        return !(b[0] == 10 || b[0] == 127 || b[0] == 0 || b[0] >= 224 ||
++                 (b[0] == 172 && b[1] is >= 16 and <= 31) || (b[0] == 192 && b[1] == 168) ||
++                 (b[0] == 169 && b[1] == 254) || (b[0] == 100 && b[1] is >= 64 and <= 127));
++    }
++
++    public static async ValueTask<Stream> SafeConnect(SocketsHttpConnectionContext ctx, CancellationToken ct)
++    {
++        var addresses = await Dns.GetHostAddressesAsync(ctx.DnsEndPoint.Host, ct);
++        var target = addresses.FirstOrDefault(IsPublic) ?? throw new HttpRequestException("Destination address is not public.");
++        if (addresses.Any(a => !IsPublic(a))) throw new HttpRequestException("Host resolves to a non-public address.");   // mixed answers: refuse (rebinding)
++        var socket = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
++        try { await socket.ConnectAsync(new IPEndPoint(target, ctx.DnsEndPoint.Port), ct); return new NetworkStream(socket, ownsSocket: true); }
++        catch { socket.Dispose(); throw; }
++    }
++}
+Binary files mid09/backend/src/SecLab.Api/wwwroot/avatars/11a4f88ad0924e1380d4644991544dea.png and sol09/backend/src/SecLab.Api/wwwroot/avatars/11a4f88ad0924e1380d4644991544dea.png differ
+Binary files mid09/backend/src/SecLab.Api/wwwroot/avatars/31455fa8e45d4fd5a5e7cf26611ba21b.png and sol09/backend/src/SecLab.Api/wwwroot/avatars/31455fa8e45d4fd5a5e7cf26611ba21b.png differ
+Binary files mid09/backend/src/SecLab.Api/wwwroot/avatars/80fb5c4e43ba4760b46e9d0492ffedff.png and sol09/backend/src/SecLab.Api/wwwroot/avatars/80fb5c4e43ba4760b46e9d0492ffedff.png differ

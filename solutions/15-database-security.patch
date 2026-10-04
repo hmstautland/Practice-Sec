@@ -1,0 +1,1147 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/appsettings.json sol15/backend/src/SecLab.Api/appsettings.json
+--- a/backend/src/SecLab.Api/appsettings.json	2026-10-04 20:50:19.952673543 +0200
++++ b/backend/src/SecLab.Api/appsettings.json	2026-10-04 20:56:02.048265193 +0200
+@@ -1,7 +1,4 @@
+ {
+-  "ConnectionStrings": {
+-    "Default": "Server=localhost,1433;Database=SecLab;User Id=sa;Password=Passw0rd!Passw0rd;TrustServerCertificate=True"
+-  },
+   "Auth": {
+     "Authority": "https://login.seclab.example/realms/seclab",
+     "Audience": "seclab-api"
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/Data/AppDbContext.cs sol15/backend/src/SecLab.Api/Data/AppDbContext.cs
+--- a/backend/src/SecLab.Api/Data/AppDbContext.cs	2026-10-04 20:50:19.944635963 +0200
++++ b/backend/src/SecLab.Api/Data/AppDbContext.cs	2026-10-04 21:00:56.694327981 +0200
+@@ -1,9 +1,10 @@
++using Microsoft.AspNetCore.DataProtection;
+ using Microsoft.EntityFrameworkCore;
+ using SecLab.Api.Models;
+ 
+ namespace SecLab.Api.Data;
+ 
+-public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
++public class AppDbContext(DbContextOptions<AppDbContext> options, IDataProtectionProvider protection) : DbContext(options)
+ {
+     public DbSet<User> Users => Set<User>();
+     public DbSet<Friendship> Friendships => Set<Friendship>();
+@@ -18,5 +19,11 @@
+         b.Entity<BlogLike>().HasKey(l => new { l.UserId, l.BlogId });
+         b.Entity<Passkey>().HasIndex(p => p.CredentialId).IsUnique();
+         b.Entity<ApiKey>().HasIndex(k => k.Prefix).IsUnique();
++
++        // Sensitive columns are encrypted at rest (randomised: the same phone number never produces the same ciphertext).
++        // The key lives in the Data Protection key ring, not in the database - whoever only reads the table sees nothing useful.
++        var encrypted = new EncryptedStringConverter(protection.CreateProtector("SecLab.Users.PersonalData.v1"));
++        b.Entity<User>().Property(u => u.Phone).HasConversion(encrypted);
++        b.Entity<User>().Property(u => u.Address).HasConversion(encrypted);
+     }
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/Data/ColumnEncryption.cs sol15/backend/src/SecLab.Api/Data/ColumnEncryption.cs
+--- a/backend/src/SecLab.Api/Data/ColumnEncryption.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Data/ColumnEncryption.cs	2026-10-04 20:55:52.232339199 +0200
+@@ -0,0 +1,13 @@
++using Microsoft.AspNetCore.DataProtection;
++using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
++
++namespace SecLab.Api.Data;
++
++/// <summary>
++/// Encrypts a string property before it is written and decrypts it after it is read, so the column holds only ciphertext.
++/// ASP.NET Core Data Protection does the cryptography (AES-256-CBC + HMAC-SHA256 by default, random IV per call, key ring with rotation);
++/// the "purpose" string separates this use from every other protector that shares the key ring.
++/// </summary>
++public sealed class EncryptedStringConverter(IDataProtector protector) : ValueConverter<string, string>(
++    plain => protector.Protect(plain),
++    stored => protector.Unprotect(stored));
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/Data/Seed.cs sol15/backend/src/SecLab.Api/Data/Seed.cs
+--- a/backend/src/SecLab.Api/Data/Seed.cs	2026-10-04 20:50:19.940573051 +0200
++++ b/backend/src/SecLab.Api/Data/Seed.cs	2026-10-04 20:55:52.240893304 +0200
+@@ -1,4 +1,5 @@
+ using Microsoft.AspNetCore.Identity;
++using Microsoft.EntityFrameworkCore;
+ using SecLab.Api.Models;
+ 
+ namespace SecLab.Api.Data;
+@@ -8,7 +9,9 @@
+     // All seeded users share the password "password123" (plaintext, on purpose).
+     public static void Run(AppDbContext db, IPasswordHasher<User> hasher)
+     {
+-        db.Database.EnsureCreated();
++        // The schema belongs to the migrations (run as seclab_migrator by docs/init-database.sh); the app login cannot create tables.
++        if (db.Database.GetPendingMigrations().Any())
++            throw new InvalidOperationException("The database schema is missing or outdated. Apply the migrations: bash docs/init-database.sh");
+ 
+         // One-time sweep: no plaintext may remain at rest, even for users who never log in again.
+         foreach (var legacy in db.Users.Where(u => !u.PasswordIsHashed).ToList())
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/Endpoints/Api.cs sol15/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-10-04 20:50:19.952788175 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-10-04 21:00:23.022765939 +0200
+@@ -214,11 +214,10 @@
+             return Results.Ok(new { items, page, pageSize, total });
+         }).MapToApiVersion(2, 0);
+ 
+-        // WEAKNESS: SQL injection - user input concatenated into raw SQL.
++        // The term is a *parameter* (EF translates Contains to a parameterised, wildcard-escaped LIKE/CHARINDEX): it can never become SQL.
+         api.MapGet("/blogs/search", async ([Required, StringLength(100, MinimumLength = 1)] string q, AppDbContext db) =>
+         {
+-            var sql = "SELECT * FROM Blogs WHERE Title LIKE '%" + q + "%' OR Body LIKE '%" + q + "%'";
+-            return await ToViews(db, db.Blogs.FromSqlRaw(sql));
++            return await ToViews(db, db.Blogs.Where(b => b.Title.Contains(q) || b.Body.Contains(q)));
+         });
+ 
+         // Input is validated (CreateBlog) and the HTML body is reduced to a safe subset before it is stored. The author is the caller.
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/Migrations/20261004185631_InitialCreate.cs sol15/backend/src/SecLab.Api/Migrations/20261004185631_InitialCreate.cs
+--- a/backend/src/SecLab.Api/Migrations/20261004185631_InitialCreate.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Migrations/20261004185631_InitialCreate.cs	2026-10-04 20:56:31.549268564 +0200
+@@ -0,0 +1,153 @@
++﻿using System;
++using Microsoft.EntityFrameworkCore.Migrations;
++
++#nullable disable
++
++namespace SecLab.Api.Migrations
++{
++    /// <inheritdoc />
++    public partial class InitialCreate : Migration
++    {
++        /// <inheritdoc />
++        protected override void Up(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.CreateTable(
++                name: "ApiKeys",
++                columns: table => new
++                {
++                    Id = table.Column<int>(type: "int", nullable: false)
++                        .Annotation("SqlServer:Identity", "1, 1"),
++                    OwnerId = table.Column<int>(type: "int", nullable: false),
++                    Name = table.Column<string>(type: "nvarchar(100)", maxLength: 100, nullable: false),
++                    Prefix = table.Column<string>(type: "nvarchar(16)", maxLength: 16, nullable: false),
++                    KeyHash = table.Column<byte[]>(type: "varbinary(max)", nullable: false),
++                    Level = table.Column<string>(type: "nvarchar(16)", maxLength: 16, nullable: false),
++                    CreatedAt = table.Column<DateTime>(type: "datetime2", nullable: false),
++                    ExpiresAt = table.Column<DateTime>(type: "datetime2", nullable: true),
++                    RevokedAt = table.Column<DateTime>(type: "datetime2", nullable: true),
++                    LastUsedAt = table.Column<DateTime>(type: "datetime2", nullable: true)
++                },
++                constraints: table =>
++                {
++                    table.PrimaryKey("PK_ApiKeys", x => x.Id);
++                });
++
++            migrationBuilder.CreateTable(
++                name: "BlogLikes",
++                columns: table => new
++                {
++                    UserId = table.Column<int>(type: "int", nullable: false),
++                    BlogId = table.Column<int>(type: "int", nullable: false)
++                },
++                constraints: table =>
++                {
++                    table.PrimaryKey("PK_BlogLikes", x => new { x.UserId, x.BlogId });
++                });
++
++            migrationBuilder.CreateTable(
++                name: "Blogs",
++                columns: table => new
++                {
++                    Id = table.Column<int>(type: "int", nullable: false)
++                        .Annotation("SqlServer:Identity", "1, 1"),
++                    AuthorId = table.Column<int>(type: "int", nullable: false),
++                    Title = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    Body = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    CreatedAt = table.Column<DateTime>(type: "datetime2", nullable: false)
++                },
++                constraints: table =>
++                {
++                    table.PrimaryKey("PK_Blogs", x => x.Id);
++                });
++
++            migrationBuilder.CreateTable(
++                name: "Friendships",
++                columns: table => new
++                {
++                    UserId = table.Column<int>(type: "int", nullable: false),
++                    FriendId = table.Column<int>(type: "int", nullable: false)
++                },
++                constraints: table =>
++                {
++                    table.PrimaryKey("PK_Friendships", x => new { x.UserId, x.FriendId });
++                });
++
++            migrationBuilder.CreateTable(
++                name: "Passkeys",
++                columns: table => new
++                {
++                    Id = table.Column<int>(type: "int", nullable: false)
++                        .Annotation("SqlServer:Identity", "1, 1"),
++                    UserId = table.Column<int>(type: "int", nullable: false),
++                    CredentialId = table.Column<byte[]>(type: "varbinary(512)", maxLength: 512, nullable: false),
++                    PublicKey = table.Column<byte[]>(type: "varbinary(max)", nullable: false),
++                    SignCount = table.Column<long>(type: "bigint", nullable: false),
++                    UserHandle = table.Column<byte[]>(type: "varbinary(max)", nullable: false),
++                    Name = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    CreatedAt = table.Column<DateTime>(type: "datetime2", nullable: false)
++                },
++                constraints: table =>
++                {
++                    table.PrimaryKey("PK_Passkeys", x => x.Id);
++                });
++
++            migrationBuilder.CreateTable(
++                name: "Users",
++                columns: table => new
++                {
++                    Id = table.Column<int>(type: "int", nullable: false)
++                        .Annotation("SqlServer:Identity", "1, 1"),
++                    Username = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    Password = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    PasswordIsHashed = table.Column<bool>(type: "bit", nullable: false),
++                    FailedLoginCount = table.Column<int>(type: "int", nullable: false),
++                    LockoutEnd = table.Column<DateTime>(type: "datetime2", nullable: true),
++                    DisplayName = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    Email = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    Phone = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    Address = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    AvatarUrl = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    Bio = table.Column<string>(type: "nvarchar(max)", nullable: false),
++                    Role = table.Column<string>(type: "nvarchar(max)", nullable: false)
++                },
++                constraints: table =>
++                {
++                    table.PrimaryKey("PK_Users", x => x.Id);
++                });
++
++            migrationBuilder.CreateIndex(
++                name: "IX_ApiKeys_Prefix",
++                table: "ApiKeys",
++                column: "Prefix",
++                unique: true);
++
++            migrationBuilder.CreateIndex(
++                name: "IX_Passkeys_CredentialId",
++                table: "Passkeys",
++                column: "CredentialId",
++                unique: true);
++        }
++
++        /// <inheritdoc />
++        protected override void Down(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.DropTable(
++                name: "ApiKeys");
++
++            migrationBuilder.DropTable(
++                name: "BlogLikes");
++
++            migrationBuilder.DropTable(
++                name: "Blogs");
++
++            migrationBuilder.DropTable(
++                name: "Friendships");
++
++            migrationBuilder.DropTable(
++                name: "Passkeys");
++
++            migrationBuilder.DropTable(
++                name: "Users");
++        }
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/Migrations/20261004185631_InitialCreate.Designer.cs sol15/backend/src/SecLab.Api/Migrations/20261004185631_InitialCreate.Designer.cs
+--- a/backend/src/SecLab.Api/Migrations/20261004185631_InitialCreate.Designer.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Migrations/20261004185631_InitialCreate.Designer.cs	2026-10-04 20:56:31.549268564 +0200
+@@ -0,0 +1,233 @@
++﻿// <auto-generated />
++using System;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Infrastructure;
++using Microsoft.EntityFrameworkCore.Metadata;
++using Microsoft.EntityFrameworkCore.Migrations;
++using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
++using SecLab.Api.Data;
++
++#nullable disable
++
++namespace SecLab.Api.Migrations
++{
++    [DbContext(typeof(AppDbContext))]
++    [Migration("20261004185631_InitialCreate")]
++    partial class InitialCreate
++    {
++        /// <inheritdoc />
++        protected override void BuildTargetModel(ModelBuilder modelBuilder)
++        {
++#pragma warning disable 612, 618
++            modelBuilder
++                .HasAnnotation("ProductVersion", "10.0.12")
++                .HasAnnotation("Relational:MaxIdentifierLength", 128);
++
++            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
++
++            modelBuilder.Entity("SecLab.Api.Models.ApiKey", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<DateTime?>("ExpiresAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<byte[]>("KeyHash")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<DateTime?>("LastUsedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Level")
++                        .IsRequired()
++                        .HasMaxLength(16)
++                        .HasColumnType("nvarchar(16)");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasMaxLength(100)
++                        .HasColumnType("nvarchar(100)");
++
++                    b.Property<int>("OwnerId")
++                        .HasColumnType("int");
++
++                    b.Property<string>("Prefix")
++                        .IsRequired()
++                        .HasMaxLength(16)
++                        .HasColumnType("nvarchar(16)");
++
++                    b.Property<DateTime?>("RevokedAt")
++                        .HasColumnType("datetime2");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("Prefix")
++                        .IsUnique();
++
++                    b.ToTable("ApiKeys");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Blog", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<int>("AuthorId")
++                        .HasColumnType("int");
++
++                    b.Property<string>("Body")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Title")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.HasKey("Id");
++
++                    b.ToTable("Blogs");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.BlogLike", b =>
++                {
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.Property<int>("BlogId")
++                        .HasColumnType("int");
++
++                    b.HasKey("UserId", "BlogId");
++
++                    b.ToTable("BlogLikes");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Friendship", b =>
++                {
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.Property<int>("FriendId")
++                        .HasColumnType("int");
++
++                    b.HasKey("UserId", "FriendId");
++
++                    b.ToTable("Friendships");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Passkey", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<byte[]>("CredentialId")
++                        .IsRequired()
++                        .HasMaxLength(512)
++                        .HasColumnType("varbinary(512)");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<byte[]>("PublicKey")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<long>("SignCount")
++                        .HasColumnType("bigint");
++
++                    b.Property<byte[]>("UserHandle")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("CredentialId")
++                        .IsUnique();
++
++                    b.ToTable("Passkeys");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.User", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<string>("Address")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("AvatarUrl")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Bio")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("DisplayName")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Email")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<int>("FailedLoginCount")
++                        .HasColumnType("int");
++
++                    b.Property<DateTime?>("LockoutEnd")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Password")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<bool>("PasswordIsHashed")
++                        .HasColumnType("bit");
++
++                    b.Property<string>("Phone")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Role")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Username")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.HasKey("Id");
++
++                    b.ToTable("Users");
++                });
++#pragma warning restore 612, 618
++        }
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/Migrations/AppDbContextModelSnapshot.cs sol15/backend/src/SecLab.Api/Migrations/AppDbContextModelSnapshot.cs
+--- a/backend/src/SecLab.Api/Migrations/AppDbContextModelSnapshot.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Migrations/AppDbContextModelSnapshot.cs	2026-10-04 20:56:31.549993250 +0200
+@@ -0,0 +1,230 @@
++﻿// <auto-generated />
++using System;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Infrastructure;
++using Microsoft.EntityFrameworkCore.Metadata;
++using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
++using SecLab.Api.Data;
++
++#nullable disable
++
++namespace SecLab.Api.Migrations
++{
++    [DbContext(typeof(AppDbContext))]
++    partial class AppDbContextModelSnapshot : ModelSnapshot
++    {
++        protected override void BuildModel(ModelBuilder modelBuilder)
++        {
++#pragma warning disable 612, 618
++            modelBuilder
++                .HasAnnotation("ProductVersion", "10.0.12")
++                .HasAnnotation("Relational:MaxIdentifierLength", 128);
++
++            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
++
++            modelBuilder.Entity("SecLab.Api.Models.ApiKey", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<DateTime?>("ExpiresAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<byte[]>("KeyHash")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<DateTime?>("LastUsedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Level")
++                        .IsRequired()
++                        .HasMaxLength(16)
++                        .HasColumnType("nvarchar(16)");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasMaxLength(100)
++                        .HasColumnType("nvarchar(100)");
++
++                    b.Property<int>("OwnerId")
++                        .HasColumnType("int");
++
++                    b.Property<string>("Prefix")
++                        .IsRequired()
++                        .HasMaxLength(16)
++                        .HasColumnType("nvarchar(16)");
++
++                    b.Property<DateTime?>("RevokedAt")
++                        .HasColumnType("datetime2");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("Prefix")
++                        .IsUnique();
++
++                    b.ToTable("ApiKeys");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Blog", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<int>("AuthorId")
++                        .HasColumnType("int");
++
++                    b.Property<string>("Body")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Title")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.HasKey("Id");
++
++                    b.ToTable("Blogs");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.BlogLike", b =>
++                {
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.Property<int>("BlogId")
++                        .HasColumnType("int");
++
++                    b.HasKey("UserId", "BlogId");
++
++                    b.ToTable("BlogLikes");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Friendship", b =>
++                {
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.Property<int>("FriendId")
++                        .HasColumnType("int");
++
++                    b.HasKey("UserId", "FriendId");
++
++                    b.ToTable("Friendships");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Passkey", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<byte[]>("CredentialId")
++                        .IsRequired()
++                        .HasMaxLength(512)
++                        .HasColumnType("varbinary(512)");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<byte[]>("PublicKey")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<long>("SignCount")
++                        .HasColumnType("bigint");
++
++                    b.Property<byte[]>("UserHandle")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("CredentialId")
++                        .IsUnique();
++
++                    b.ToTable("Passkeys");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.User", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<string>("Address")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("AvatarUrl")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Bio")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("DisplayName")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Email")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<int>("FailedLoginCount")
++                        .HasColumnType("int");
++
++                    b.Property<DateTime?>("LockoutEnd")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Password")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<bool>("PasswordIsHashed")
++                        .HasColumnType("bit");
++
++                    b.Property<string>("Phone")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Role")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Username")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.HasKey("Id");
++
++                    b.ToTable("Users");
++                });
++#pragma warning restore 612, 618
++        }
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/packages.lock.json sol15/backend/src/SecLab.Api/packages.lock.json
+--- a/backend/src/SecLab.Api/packages.lock.json	2026-10-04 20:50:19.953968080 +0200
++++ b/backend/src/SecLab.Api/packages.lock.json	2026-10-04 20:56:18.563801525 +0200
+@@ -40,6 +40,23 @@
+           "Microsoft.IdentityModel.Protocols.OpenIdConnect": "8.19.2"
+         }
+       },
++      "Microsoft.EntityFrameworkCore.Design": {
++        "type": "Direct",
++        "requested": "[10.0.12, )",
++        "resolved": "10.0.12",
++        "contentHash": "I/IwEkUEUoa62UMJHh2+04oAs+gZz4QEunpZ3MGtAf12PZUcTduZLuGZEp3FAZ7wkmkSThZez41P8tgFj8QYKQ==",
++        "dependencies": {
++          "Humanizer.Core": "2.14.1",
++          "Microsoft.Build.Framework": "18.0.2",
++          "Microsoft.CodeAnalysis.CSharp": "5.0.0",
++          "Microsoft.CodeAnalysis.CSharp.Workspaces": "5.0.0",
++          "Microsoft.CodeAnalysis.Workspaces.MSBuild": "5.0.0",
++          "Microsoft.EntityFrameworkCore.Relational": "10.0.12",
++          "Microsoft.Extensions.DependencyModel": "10.0.12",
++          "Mono.TextTemplating": "3.0.0",
++          "Newtonsoft.Json": "13.0.4"
++        }
++      },
+       "Microsoft.EntityFrameworkCore.SqlServer": {
+         "type": "Direct",
+         "requested": "[10.0.12, )",
+@@ -160,6 +177,11 @@
+           "Microsoft.Bcl.Memory": "9.0.14"
+         }
+       },
++      "Humanizer.Core": {
++        "type": "Transitive",
++        "resolved": "2.14.1",
++        "contentHash": "lQKvtaTDOXnoVJ20ibTuSIOf2i0uO0MPbDhd1jm238I+U/2ZnRENj0cktKZhtchBMtCUSRQ5v4xBCUbKNmyVMw=="
++      },
+       "libsodium": {
+         "type": "Transitive",
+         "resolved": "1.0.20.1",
+@@ -180,6 +202,71 @@
+         "resolved": "9.0.14",
+         "contentHash": "laQCcjTM2FnbyznkAu9hwBuQh3z2/OtJKwjGkJOUevylFpFXZIUVq/+MU2jM0HQm1n5wsjjwtLIDOiWJ6Nai3A=="
+       },
++      "Microsoft.Build.Framework": {
++        "type": "Transitive",
++        "resolved": "18.0.2",
++        "contentHash": "sOSb+0J4G/jCBW/YqmRuL0eOMXgfw1KQLdC9TkbvfA5xs7uNm+PBQXJCOzSJGXtZcZrtXozcwxPmUiRUbmd7FA=="
++      },
++      "Microsoft.CodeAnalysis.Analyzers": {
++        "type": "Transitive",
++        "resolved": "3.11.0",
++        "contentHash": "v/EW3UE8/lbEYHoC2Qq7AR/DnmvpgdtAMndfQNmpuIMx/Mto8L5JnuCfdBYtgvalQOtfNCnxFejxuRrryvUTsg=="
++      },
++      "Microsoft.CodeAnalysis.Common": {
++        "type": "Transitive",
++        "resolved": "5.0.0",
++        "contentHash": "ZXRAdvH6GiDeHRyd3q/km8Z44RoM6FBWHd+gen/la81mVnAdHTEsEkO5J0TCNXBymAcx5UYKt5TvgKBhaLJEow==",
++        "dependencies": {
++          "Microsoft.CodeAnalysis.Analyzers": "3.11.0"
++        }
++      },
++      "Microsoft.CodeAnalysis.CSharp": {
++        "type": "Transitive",
++        "resolved": "5.0.0",
++        "contentHash": "5DSyJ9bk+ATuDy7fp2Zt0mJStDVKbBoiz1DyfAwSa+k4H4IwykAUcV3URelw5b8/iVbfSaOwkwmPUZH6opZKCw==",
++        "dependencies": {
++          "Microsoft.CodeAnalysis.Analyzers": "3.11.0",
++          "Microsoft.CodeAnalysis.Common": "[5.0.0]"
++        }
++      },
++      "Microsoft.CodeAnalysis.CSharp.Workspaces": {
++        "type": "Transitive",
++        "resolved": "5.0.0",
++        "contentHash": "Al/Q8B+yO8odSqGVpSvrShMFDvlQdIBU//F3E6Rb0YdiLSALE9wh/pvozPNnfmh5HDnvU+mkmSjpz4hQO++jaA==",
++        "dependencies": {
++          "Humanizer.Core": "2.14.1",
++          "Microsoft.CodeAnalysis.Analyzers": "3.11.0",
++          "Microsoft.CodeAnalysis.CSharp": "[5.0.0]",
++          "Microsoft.CodeAnalysis.Common": "[5.0.0]",
++          "Microsoft.CodeAnalysis.Workspaces.Common": "[5.0.0]",
++          "System.Composition": "9.0.0"
++        }
++      },
++      "Microsoft.CodeAnalysis.Workspaces.Common": {
++        "type": "Transitive",
++        "resolved": "5.0.0",
++        "contentHash": "ZbUmIvT6lqTNKiv06Jl5wf0MTMi1vQ1oH7ou4CLcs2C/no/L7EhP3T8y3XXvn9VbqMcJaJnEsNA1jwYUMgc5jg==",
++        "dependencies": {
++          "Humanizer.Core": "2.14.1",
++          "Microsoft.CodeAnalysis.Analyzers": "3.11.0",
++          "Microsoft.CodeAnalysis.Common": "[5.0.0]",
++          "System.Composition": "9.0.0"
++        }
++      },
++      "Microsoft.CodeAnalysis.Workspaces.MSBuild": {
++        "type": "Transitive",
++        "resolved": "5.0.0",
++        "contentHash": "/G+LVoAGMz6Ae8nm+PGLxSw+F5RjYx/J7irbTO5uKAPw1bxHyQJLc/YOnpDxt+EpPtYxvC9wvBsg/kETZp1F9Q==",
++        "dependencies": {
++          "Humanizer.Core": "2.14.1",
++          "Microsoft.Build.Framework": "17.11.31",
++          "Microsoft.CodeAnalysis.Analyzers": "3.11.0",
++          "Microsoft.CodeAnalysis.Workspaces.Common": "[5.0.0]",
++          "Microsoft.VisualStudio.SolutionPersistence": "1.0.52",
++          "Newtonsoft.Json": "13.0.3",
++          "System.Composition": "9.0.0"
++        }
++      },
+       "Microsoft.Data.SqlClient": {
+         "type": "Transitive",
+         "resolved": "6.1.6",
+@@ -230,6 +317,11 @@
+           "Microsoft.EntityFrameworkCore": "10.0.12"
+         }
+       },
++      "Microsoft.Extensions.DependencyModel": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "rDPQVTxh/zMTDF7wHlRqL/jjZbwjAP6315ydBxj51pZW7qkAwGwjoSiMutxYI91xmOE3ZXjAGHbYRqzyJV7Urw=="
++      },
+       "Microsoft.Identity.Client": {
+         "type": "Transitive",
+         "resolved": "4.84.2",
+@@ -313,6 +405,24 @@
+         "resolved": "1.0.0",
+         "contentHash": "N4KeF3cpcm1PUHym1RmakkzfkEv3GRMyofVv40uXsQhCQeglr2OHNcUk2WOG51AKpGO8ynGpo9M/kFXSzghwug=="
+       },
++      "Microsoft.VisualStudio.SolutionPersistence": {
++        "type": "Transitive",
++        "resolved": "1.0.52",
++        "contentHash": "oNv2JtYXhpdJrX63nibx1JT3uCESOBQ1LAk7Dtz/sr0+laW0KRM6eKp4CZ3MHDR2siIkKsY8MmUkeP5DKkQQ5w=="
++      },
++      "Mono.TextTemplating": {
++        "type": "Transitive",
++        "resolved": "3.0.0",
++        "contentHash": "YqueG52R/Xej4VVbKuRIodjiAhV0HR/XVbLbNrJhCZnzjnSjgMJ/dCdV0akQQxavX6hp/LC6rqLGLcXeQYU7XA==",
++        "dependencies": {
++          "System.CodeDom": "6.0.0"
++        }
++      },
++      "Newtonsoft.Json": {
++        "type": "Transitive",
++        "resolved": "13.0.4",
++        "contentHash": "pdgNNMai3zv51W5aq268sujXUyx7SNdE2bj1wZcWjAQrKMFZV260lbqYop1d2GM67JI1huLRwxo9ZqnfF/lC6A=="
++      },
+       "NSec.Cryptography": {
+         "type": "Transitive",
+         "resolved": "25.4.0",
+@@ -350,6 +460,59 @@
+           "System.Memory.Data": "8.0.1"
+         }
+       },
++      "System.CodeDom": {
++        "type": "Transitive",
++        "resolved": "6.0.0",
++        "contentHash": "CPc6tWO1LAer3IzfZufDBRL+UZQcj5uS207NHALQzP84Vp/z6wF0Aa0YZImOQY8iStY0A2zI/e3ihKNPfUm8XA=="
++      },
++      "System.Composition": {
++        "type": "Transitive",
++        "resolved": "9.0.0",
++        "contentHash": "3Djj70fFTraOarSKmRnmRy/zm4YurICm+kiCtI0dYRqGJnLX6nJ+G3WYuFJ173cAPax/gh96REcbNiVqcrypFQ==",
++        "dependencies": {
++          "System.Composition.AttributedModel": "9.0.0",
++          "System.Composition.Convention": "9.0.0",
++          "System.Composition.Hosting": "9.0.0",
++          "System.Composition.Runtime": "9.0.0",
++          "System.Composition.TypedParts": "9.0.0"
++        }
++      },
++      "System.Composition.AttributedModel": {
++        "type": "Transitive",
++        "resolved": "9.0.0",
++        "contentHash": "iri00l/zIX9g4lHMY+Nz0qV1n40+jFYAmgsaiNn16xvt2RDwlqByNG4wgblagnDYxm3YSQQ0jLlC/7Xlk9CzyA=="
++      },
++      "System.Composition.Convention": {
++        "type": "Transitive",
++        "resolved": "9.0.0",
++        "contentHash": "+vuqVP6xpi582XIjJi6OCsIxuoTZfR0M7WWufk3uGDeCl3wGW6KnpylUJ3iiXdPByPE0vR5TjJgR6hDLez4FQg==",
++        "dependencies": {
++          "System.Composition.AttributedModel": "9.0.0"
++        }
++      },
++      "System.Composition.Hosting": {
++        "type": "Transitive",
++        "resolved": "9.0.0",
++        "contentHash": "OFqSeFeJYr7kHxDfaViGM1ymk7d4JxK//VSoNF9Ux0gpqkLsauDZpu89kTHHNdCWfSljbFcvAafGyBoY094btQ==",
++        "dependencies": {
++          "System.Composition.Runtime": "9.0.0"
++        }
++      },
++      "System.Composition.Runtime": {
++        "type": "Transitive",
++        "resolved": "9.0.0",
++        "contentHash": "w1HOlQY1zsOWYussjFGZCEYF2UZXgvoYnS94NIu2CBnAGMbXFAX8PY8c92KwUItPmowal68jnVLBCzdrWLeEKA=="
++      },
++      "System.Composition.TypedParts": {
++        "type": "Transitive",
++        "resolved": "9.0.0",
++        "contentHash": "aRZlojCCGEHDKqh43jaDgaVpYETsgd7Nx4g1zwLKMtv4iTo0627715ajEFNpEEBTgLmvZuv8K0EVxc3sM4NWJA==",
++        "dependencies": {
++          "System.Composition.AttributedModel": "9.0.0",
++          "System.Composition.Hosting": "9.0.0",
++          "System.Composition.Runtime": "9.0.0"
++        }
++      },
+       "System.Configuration.ConfigurationManager": {
+         "type": "Transitive",
+         "resolved": "9.0.11",
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/Program.cs sol15/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-10-04 20:50:19.953996813 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-10-04 20:56:28.750344792 +0200
+@@ -1,3 +1,4 @@
++using Microsoft.AspNetCore.DataProtection;
+ using Microsoft.EntityFrameworkCore;
+ using SecLab.Api.Data;
+ using Asp.Versioning;
+@@ -91,7 +92,15 @@
+     o.Origins = builder.Configuration.GetSection("WebAuthn:Origins").Get<HashSet<string>>()!;   // exact origins that may run the ceremony
+ });
+ builder.Services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
+-builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
++// The app's database identity (seclab_app: row access only) comes from the environment / a secret store, never from a committed file.
++builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlServer(builder.Configuration.GetConnectionString("Default")
++    ?? throw new InvalidOperationException("ConnectionStrings:Default is not set. Run docs/init-secrets.sh and load .env (set -a; source .env; set +a).")));
++// Key ring for column encryption (AppDbContext). Keys are stored on disk outside the repository and the database; in production put
++// them in shared, protected storage (e.g. Azure Blob/Key Vault) and protect them with a key from the vault (Part 2).
++builder.Services.AddDataProtection()
++    .SetApplicationName("SecLab")
++    .PersistKeysToFileSystem(new DirectoryInfo(builder.Configuration["DataProtection:KeysPath"]
++        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SecLab", "keys")));
+ // CORS allow-list: exact origins, methods and headers - nothing is "any".
+ var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
+ builder.Services.AddCors(o => o.AddDefaultPolicy(p => p
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/backend/src/SecLab.Api/SecLab.Api.csproj sol15/backend/src/SecLab.Api/SecLab.Api.csproj
+--- a/backend/src/SecLab.Api/SecLab.Api.csproj	2026-10-04 20:50:19.954053237 +0200
++++ b/backend/src/SecLab.Api/SecLab.Api.csproj	2026-10-04 20:56:17.595648570 +0200
+@@ -16,5 +16,6 @@
+     <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.19.0" />
+     <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" Version="1.19.0" />
+     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.12" />
++    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.12" PrivateAssets="all" />   <!-- dotnet ef: migrations (design time only) -->
+   </ItemGroup>
+ </Project>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/docker-compose.yml sol15/docker-compose.yml
+--- a/docker-compose.yml	2026-09-30 12:08:21.985733734 +0200
++++ b/docker-compose.yml	2026-10-04 20:58:21.825497172 +0200
+@@ -1,16 +1,24 @@
+-# Intentionally insecure starter: the SA password is weak and committed on purpose.
+-# Fixing this is part of the "Database & SQL security" tutorial step.
++# Secrets come from .env (git-ignored): run  bash docs/init-secrets.sh  once. docker compose reads .env automatically.
++# After the first start run  bash docs/init-database.sh  (creates the logins, applies the migrations).
+ services:
+   sqlserver:
+     image: mcr.microsoft.com/mssql/server:2022-latest
+     container_name: seclab-sql
+     environment:
+       ACCEPT_EULA: "Y"
+-      MSSQL_SA_PASSWORD: "Passw0rd!Passw0rd"
++      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}   # from .env (docs/init-secrets.sh); only used when the data volume is created: after changing it, docker compose down -v
+     ports:
+-      - "1433:1433"
++      - "127.0.0.1:1433:1433"            # loopback only: the database is not a public service
+     volumes:
+       - sqldata:/var/opt/mssql
++      - ./infra/sql/mssql.conf:/var/opt/mssql/mssql.conf:ro      # TLS 1.2+, encryption forced for every client
++      - ./certs/sql/server.crt:/var/opt/mssql/certs/server.crt:ro
++      - ./certs/sql/server.key:/var/opt/mssql/certs/server.key:ro
++    healthcheck:
++      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' || exit 1"]
++      interval: 5s
++      timeout: 5s
++      retries: 30
+   # Identity provider for step 03 (OAuth2 / OpenID Connect). Dev mode, HTTP, weak admin password: local lab only.
+   # Start with:  docker compose --profile oidc up -d keycloak     (admin console: http://localhost:8081, admin/admin)
+   keycloak:
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/docs/02-passwords.md sol15/docs/02-passwords.md
+--- a/docs/02-passwords.md	2026-09-30 11:05:09.343499378 +0200
++++ b/docs/02-passwords.md	2026-10-04 21:02:31.670065259 +0200
+@@ -71,7 +71,7 @@
+ ```
+ 7 tests: hash at rest, weak password rejected, login works and leaks nothing, seeded users still work, legacy upgrade, indistinguishable failures, lockout. (On the starter 6 of them are red; the seeded-login test is a regression guard and is already green.)
+ 
+-Manual: run the guessing loop from the Threat section – after 5 wrong attempts even the right password fails. Look at the table: `docker exec -it seclab-sql /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Passw0rd!Passw0rd' -d SecLab -Q "select Username, Password from Users"`.
++Manual: run the guessing loop from the Threat section – after 5 wrong attempts even the right password fails. Look at the table: `docker exec -it seclab-sql /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U seclab_app -P "$SECLAB_APP_PASSWORD" -d SecLab -Q "select Username, Password from Users"` (the login from step 15's `.env`; before step 15 it was `sa` with the weak compose password).
+ 
+ Checklist:
+ - [ ] `Step=02` tests green, and `Step=01` still green
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/docs/attack-scripts/06-api-key-attacks.sh sol15/docs/attack-scripts/06-api-key-attacks.sh
+--- a/docs/attack-scripts/06-api-key-attacks.sh	2026-09-30 11:23:32.269206017 +0200
++++ b/docs/attack-scripts/06-api-key-attacks.sh	2026-10-04 21:02:31.670000360 +0200
+@@ -18,5 +18,6 @@
+ echo "== 8. ordinary user asks for an admin key (403)";  $C -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: Bearer $($C -X POST $KC/realms/seclab/protocol/openid-connect/token -d grant_type=password -d client_id=seclab-dev-cli -d username=dave -d password=password123 | jq -r .access_token)" -H 'Content-Type: application/json' -d '{"name":"x","level":"admin"}' $API/api/keys
+ echo "== 9. revoke, then reuse (204 then 401)";          $C -o /dev/null -w '%{http_code} ' -X DELETE -H "Authorization: Bearer $TOKEN" $API/api/keys/$ID; $C -o /dev/null -w '%{http_code}\n' -H "X-Api-Key: $KEY" $API/api/partner/blogs
+ echo "== 10. what does the database hold? (secret must not appear)"
+-docker exec seclab-sql /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Passw0rd!Passw0rd' -d SecLab -h -1 -W \
++set -a; . ./.env; set +a   # since step 15 the database login comes from .env (no sa)
++docker exec seclab-sql /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U seclab_app -P "$SECLAB_APP_PASSWORD" -d SecLab -h -1 -W \
+   -Q "SET NOCOUNT ON; SELECT TOP 3 Prefix, CONVERT(varchar(80), KeyHash, 2) AS KeyHash, Level FROM ApiKeys ORDER BY Id DESC" 2>/dev/null
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/docs/init-database.sh sol15/docs/init-database.sh
+--- a/docs/init-database.sh	1970-01-01 01:00:00.000000000 +0100
++++ b/docs/init-database.sh	2026-10-04 20:56:02.023677007 +0200
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++# One-time (and idempotent) database setup after `docker compose up -d sqlserver`:
++#   1. as sa: create the database, the logins seclab_migrator / seclab_app and their rights   (infra/sql/init.sql)
++#   2. as seclab_migrator: apply the EF Core migrations                                       (the app never does this itself)
++# Requires .env (bash docs/init-secrets.sh), the container running, and the .NET 10 SDK on PATH.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++set -a; . ./.env; set +a
++SQL=(docker exec -i "${SQL_CONTAINER:-seclab-sql}" /opt/mssql-tools18/bin/sqlcmd -C -S localhost -b)
++
++echo "waiting for SQL Server ..."
++for _ in $(seq 1 60); do "${SQL[@]}" -U sa -P "$MSSQL_SA_PASSWORD" -Q "SELECT 1" >/dev/null 2>&1 && break; sleep 2; done
++
++"${SQL[@]}" -U sa -P "$MSSQL_SA_PASSWORD" -v APP_PASSWORD="$SECLAB_APP_PASSWORD" MIGRATOR_PASSWORD="$SECLAB_MIGRATOR_PASSWORD" < infra/sql/init.sql
++echo "logins and permissions are in place"
++
++dotnet tool restore >/dev/null
++dotnet ef database update --project backend/src/SecLab.Api --connection "$ConnectionStrings__Migrator"
++echo "migrations applied"
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/docs/owasp-matrix.md sol15/docs/owasp-matrix.md
+--- a/docs/owasp-matrix.md	2026-10-04 20:50:19.954274085 +0200
++++ b/docs/owasp-matrix.md	2026-10-04 21:02:13.235536993 +0200
+@@ -15,10 +15,10 @@
+ | ID | Title | Where / how in SecLab | Mitigation | Evidence | Status |
+ |----|-------|-----------------------|------------|----------|--------|
+ | A01 | Broken Access Control | Object/function access in `/api/users/{id}`, blogs, admin routes; SSRF via link preview | Step 05 default-deny, resource handlers, DTOs per audience; step 09 allow-lists incl. SSRF policy; step 06 key levels | Step=05, Step=09 | Mitigated |
+-| A02 | Security Misconfiguration | Dev exception page, open CORS, `*` hosts, verbose headers, dev-mode Keycloak/SQL, weak `sa` password in compose | Steps 01, 09, 11, 13 (headers, CSP); SQL login and secrets are handled in step 15 and Part 2 | Step=13 | Partial |
++| A02 | Security Misconfiguration | Dev exception page, open CORS, `*` hosts, verbose headers, dev-mode Keycloak/SQL, weak `sa` password in compose | Steps 01, 09, 11, 13 (headers, CSP); step 15: secrets from `.env`, least-privilege SQL logins, TLS to the database. Left: dev-mode Keycloak with `admin/admin`, lab certificate, secrets in a file instead of a vault (Part 2) | Step=15 | Partial |
+ | A03 | Software Supply Chain Failures | NuGet and npm dependencies, container images, CI actions | Step 13: NuGet audit as build errors, lock files, unused package removed; `npm audit`; Part 2 pins actions and scans images | Step=13 | Partial |
+-| A04 | Cryptographic Failures | Passwords at rest, TLS in transit, API-key digests, DB columns holding phone/address | Step 01 TLS 1.2+, HSTS; step 02 PBKDF2 hashing; step 06 hashed keys; column encryption in step 15 | Step=02 | Partial |
+-| A05 | Injection | `/api/blogs/search` builds SQL by concatenation; HTML in blog bodies (XSS) | Step 10 validation + HTML sanitising (server and browser); SQL injection is fixed in step 15 | Step=10 | Partial |
++| A04 | Cryptographic Failures | Passwords at rest, TLS in transit, API-key digests, DB columns holding phone/address | Step 01 TLS 1.2+, HSTS; step 02 PBKDF2 hashing; step 06 hashed keys; step 15 verified TLS to SQL Server and encrypted phone/address columns. Left: the Data Protection key ring is an unprotected file (vault/HSM in Part 2), no Always Encrypted | Step=15 | Partial |
++| A05 | Injection | `/api/blogs/search` built SQL by concatenation (fixed); HTML in blog bodies (XSS) | Step 10 validation + HTML sanitising; step 15 parameterised search, EF1002/EF1003 build errors, app login without DDL rights (blast radius) | Step=15 | Mitigated |
+ | A06 | Insecure Design | Trust assumptions: client-chosen identity, unlimited friends/likes, no abuse limits, unversioned API | Steps 03/05 (identity from tokens), 07 rate limits, 08 versioning and retirement, 04 step-up for destructive actions | Step=04 | Mitigated |
+ | A07 | Authentication Failures | Login, registration, API keys, tokens, WebAuthn | Step 02 hashing/lockout/uniform failures, step 03 OIDC + PKCE, step 04 passkeys, step 06 keys, step 07 throttling | Step=03 | Mitigated |
+ | A08 | Software or Data Integrity Failures | Blog HTML from users, JWT signature validation, dependency and CI artefacts | Step 03 signature/issuer/audience validation, step 10 sanitising, step 13 lock files; signed images and pipeline integrity in Part 2 | Step=03 | Partial |
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/docs/reset-database.sh sol15/docs/reset-database.sh
+--- a/docs/reset-database.sh	2026-09-30 10:49:25.503407712 +0200
++++ b/docs/reset-database.sh	2026-10-04 20:55:52.227470895 +0200
+@@ -1,6 +1,10 @@
+ #!/usr/bin/env bash
+-# Drops the SecLab database. The API re-creates and re-seeds it on next start (EnsureCreated + Seed).
+-# Needed whenever a step changes the schema, because the starter has no migrations.
+-docker exec seclab-sql /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Passw0rd!Passw0rd' \
++# Drops the SecLab database and re-creates it: logins, rights and migrations (docs/init-database.sh); the API seeds it on next start.
++# Needed whenever the schema changes in a way a migration cannot express, or when you want a clean slate.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++set -a; . ./.env; set +a
++docker exec "${SQL_CONTAINER:-seclab-sql}" /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "$MSSQL_SA_PASSWORD" \
+   -Q "IF DB_ID('SecLab') IS NOT NULL BEGIN ALTER DATABASE SecLab SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE SecLab; END"
+ echo "SecLab database dropped."
++bash docs/init-database.sh
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/dotnet-tools.json sol15/dotnet-tools.json
+--- a/dotnet-tools.json	1970-01-01 01:00:00.000000000 +0100
++++ b/dotnet-tools.json	2026-10-04 20:56:12.335791798 +0200
+@@ -0,0 +1,13 @@
++{
++  "version": 1,
++  "isRoot": true,
++  "tools": {
++    "dotnet-ef": {
++      "version": "10.0.12",
++      "commands": [
++        "dotnet-ef"
++      ],
++      "rollForward": false
++    }
++  }
++}
+\ No newline at end of file
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/.editorconfig sol15/.editorconfig
+--- a/.editorconfig	1970-01-01 01:00:00.000000000 +0100
++++ b/.editorconfig	2026-10-04 21:00:21.887314052 +0200
+@@ -0,0 +1,8 @@
++root = true
++
++[*.cs]
++# Raw SQL assembled from strings is SQL injection. Parameterise (FromSql($"..."), ExecuteSql($"..."), LINQ) instead.
++# EF1002: interpolated string passed to FromSqlRaw / ExecuteSqlRaw / SqlQueryRaw
++dotnet_diagnostic.EF1002.severity = error
++# EF1003: concatenated string passed to the same methods (this is how the starter's search was written)
++dotnet_diagnostic.EF1003.severity = error
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/infra/sql/init.sql sol15/infra/sql/init.sql
+--- a/infra/sql/init.sql	1970-01-01 01:00:00.000000000 +0100
++++ b/infra/sql/init.sql	2026-10-04 20:55:36.921756015 +0200
+@@ -0,0 +1,29 @@
++-- Creates the database, the two identities and their rights. Idempotent: running it again rotates the passwords.
++-- Run by docs/init-database.sh as sa with:  sqlcmd -v APP_PASSWORD=... MIGRATOR_PASSWORD=... -i infra/sql/init.sql
++-- Two identities, because "can change the schema" and "runs all day on user input" must not be the same power:
++--   seclab_migrator  schema owner, used only by the migration step (never by the running app)
++--   seclab_app       the web app: read/write rows in the application schema, nothing else
++:on error exit
++IF DB_ID('SecLab') IS NULL CREATE DATABASE SecLab;
++GO
++IF SUSER_ID('seclab_app') IS NULL
++    CREATE LOGIN seclab_app WITH PASSWORD = '$(APP_PASSWORD)', DEFAULT_DATABASE = SecLab, CHECK_POLICY = ON, CHECK_EXPIRATION = OFF;
++ELSE
++    ALTER LOGIN seclab_app WITH PASSWORD = '$(APP_PASSWORD)';
++IF SUSER_ID('seclab_migrator') IS NULL
++    CREATE LOGIN seclab_migrator WITH PASSWORD = '$(MIGRATOR_PASSWORD)', DEFAULT_DATABASE = SecLab, CHECK_POLICY = ON, CHECK_EXPIRATION = OFF;
++ELSE
++    ALTER LOGIN seclab_migrator WITH PASSWORD = '$(MIGRATOR_PASSWORD)';
++GO
++USE SecLab;
++GO
++IF USER_ID('seclab_app') IS NULL CREATE USER seclab_app FOR LOGIN seclab_app WITH DEFAULT_SCHEMA = dbo;
++IF USER_ID('seclab_migrator') IS NULL CREATE USER seclab_migrator FOR LOGIN seclab_migrator WITH DEFAULT_SCHEMA = dbo;
++GO
++-- migrator: create/alter/drop objects, and read/write the migration history (and move data inside migrations); no server-level rights
++ALTER ROLE db_ddladmin ADD MEMBER seclab_migrator;
++ALTER ROLE db_datareader ADD MEMBER seclab_migrator;
++ALTER ROLE db_datawriter ADD MEMBER seclab_migrator;
++-- app: exactly the four row operations, on the application schema (this also covers tables a later migration adds). No DDL, no EXECUTE, no other schemas.
++GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::dbo TO seclab_app;
++GO
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid15/infra/sql/mssql.conf sol15/infra/sql/mssql.conf
+--- a/infra/sql/mssql.conf	1970-01-01 01:00:00.000000000 +0100
++++ b/infra/sql/mssql.conf	2026-10-04 20:55:36.920689249 +0200
+@@ -0,0 +1,5 @@
++[network]
++tlscert = /var/opt/mssql/certs/server.crt
++tlskey = /var/opt/mssql/certs/server.key
++tlsprotocols = 1.2
++forceencryption = 1

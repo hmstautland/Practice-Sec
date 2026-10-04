@@ -1,0 +1,1043 @@
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/appsettings.Development.json sol17/backend/src/SecLab.Gateway/appsettings.Development.json
+--- a/backend/src/SecLab.Gateway/appsettings.Development.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/appsettings.Development.json	2026-10-04 21:58:26.460092571 +0200
+@@ -0,0 +1,3 @@
++{
++  "Bff": { "Authority": "http://localhost:8081/realms/seclab" }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/appsettings.json sol17/backend/src/SecLab.Gateway/appsettings.json
+--- a/backend/src/SecLab.Gateway/appsettings.json	2026-10-04 22:13:22.082530162 +0200
++++ b/backend/src/SecLab.Gateway/appsettings.json	2026-10-04 22:17:55.144532368 +0200
+@@ -5,6 +5,14 @@
+     "MaxBodyBytes": 3145728,
+     "AdminNetworks": [ "127.0.0.1/32", "::1/128" ]
+   },
++  "Bff": {
++    "Authority": "https://login.seclab.example/realms/seclab",
++    "ClientId": "seclab-bff",
++    "PublicOrigin": "https://localhost:5173",
++    "IdleTimeout": "00:30:00",
++    "SessionLifetime": "08:00:00",
++    "RefreshSkew": "00:01:00"
++  },
+   "ReverseProxy": {
+     "Routes": {
+       "avatars": {
+@@ -14,6 +22,8 @@
+         "Transforms": [
+           { "RequestHeaderOriginalHost": "true" },
+           { "X-Forwarded": "Set", "For": "Set", "Proto": "Set", "Host": "Set", "Prefix": "Off" },
++          { "RequestHeaderRemove": "Cookie" },
++          { "ResponseHeaderRemove": "Set-Cookie" },
+           { "ResponseHeaderRemove": "Server" }
+         ]
+       },
+@@ -31,6 +41,9 @@
+           { "RequestHeaderRemove": "X-Real-IP" },
+           { "RequestHeaderRemove": "X-Original-URL" },
+           { "RequestHeaderRemove": "X-Rewrite-URL" },
++          { "RequestHeaderRemove": "Cookie" },
++          { "RequestHeaderRemove": "X-CSRF" },
++          { "ResponseHeaderRemove": "Set-Cookie" },
+           { "ResponseHeaderRemove": "Server" },
+           { "ResponseHeaderRemove": "X-Powered-By" },
+           { "ResponseHeaderRemove": "X-AspNet-Version" },
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/Bff/BffExtensions.cs sol17/backend/src/SecLab.Gateway/Bff/BffExtensions.cs
+--- a/backend/src/SecLab.Gateway/Bff/BffExtensions.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/Bff/BffExtensions.cs	2026-10-04 22:18:47.742540275 +0200
+@@ -0,0 +1,170 @@
++using Microsoft.AspNetCore.DataProtection;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.AspNetCore.Authentication.Cookies;
++using Microsoft.AspNetCore.Authentication.OpenIdConnect;
++using Microsoft.Extensions.DependencyInjection.Extensions;
++using Microsoft.IdentityModel.Protocols.OpenIdConnect;
++
++namespace SecLab.Gateway.Bff;
++
++public static class BffExtensions
++{
++    public static void AddBff(this WebApplicationBuilder builder)
++    {
++        var settings = BffSettings.From(builder.Configuration);
++        var services = builder.Services;
++        services.TryAddSingleton(TimeProvider.System);                     // tests replace it: every time decision below goes through this provider
++        services.AddSingleton(settings);
++        services.AddSingleton<SessionStore>();
++        services.AddSingleton<SessionTokens>();
++        services.AddDataProtection().SetApplicationName("SecLab.Gateway");
++
++        services.AddAuthentication()
++            .AddCookie(BffDefaults.CookieScheme, o =>
++            {
++                o.Cookie.Name = BffDefaults.CookieName;
++                o.Cookie.HttpOnly = true;                                   // not readable by scripts: an XSS cannot copy it out
++                o.Cookie.SecurePolicy = CookieSecurePolicy.Always;
++                o.Cookie.SameSite = SameSiteMode.Strict;                    // not sent on requests started by other sites
++                o.Cookie.Path = "/";
++                o.ExpireTimeSpan = settings.SessionLifetime;
++                o.SlidingExpiration = false;                                // the server-side store tracks idle time; the cookie is never re-issued
++                o.Events.OnRedirectToLogin = ctx => { ctx.Response.StatusCode = StatusCodes.Status401Unauthorized; return Task.CompletedTask; };       // an API answers, it does not redirect
++                o.Events.OnRedirectToAccessDenied = ctx => { ctx.Response.StatusCode = StatusCodes.Status403Forbidden; return Task.CompletedTask; };
++            })
++            .AddOpenIdConnect(BffDefaults.OidcScheme, o =>
++            {
++                o.SignInScheme = BffDefaults.CookieScheme;
++                o.Authority = settings.Authority;
++                o.ClientId = settings.ClientId;
++                o.ClientSecret = settings.ClientSecret;                     // confidential client: the secret is only ever sent to the token endpoint, server to server
++                o.ResponseType = OpenIdConnectResponseType.Code;
++                o.ResponseMode = OpenIdConnectResponseMode.Query;
++                o.UsePkce = true;
++                o.CallbackPath = BffDefaults.CallbackPath;
++                o.Scope.Clear();
++                foreach (var scope in new[] { "openid", "profile", "email" }) o.Scope.Add(scope);
++                o.SaveTokens = true;                                        // into the ticket; SessionStore moves them to server memory
++                o.GetClaimsFromUserInfoEndpoint = false;
++                o.MapInboundClaims = false;
++                o.RequireHttpsMetadata = !builder.Environment.IsDevelopment();   // plain HTTP only for the dev Keycloak, as in step 03
++                o.BackchannelTimeout = TimeSpan.FromSeconds(10);
++                o.TokenValidationParameters.NameClaimType = "preferred_username";
++                o.TokenValidationParameters.ClockSkew = TimeSpan.FromSeconds(30);
++                // The correlation / nonce cookies must survive the redirect back from the IdP (a cross-site top-level navigation): Lax, not None.
++                foreach (var c in new[] { o.CorrelationCookie, o.NonceCookie })
++                {
++                    c.SameSite = SameSiteMode.Lax;
++                    c.SecurePolicy = CookieSecurePolicy.Always;
++                    c.HttpOnly = true;
++                }
++                o.Events = new OpenIdConnectEvents
++                {
++                    // The redirect URI is configuration, not "whatever Host header arrived".
++                    OnRedirectToIdentityProvider = ctx => { ctx.ProtocolMessage.RedirectUri = settings.PublicOrigin + BffDefaults.CallbackPath; return Task.CompletedTask; },
++                    // Logout: do not redirect inside an XHR; remember the IdP's end-session URL and let the endpoint hand it to the page.
++                    OnRedirectToIdentityProviderForSignOut = ctx =>
++                    {
++                        ctx.ProtocolMessage.PostLogoutRedirectUri = settings.PublicOrigin + "/";
++                        ctx.Properties.Items["endSessionUrl"] = ctx.ProtocolMessage.CreateLogoutRequestUrl();
++                        ctx.HandleResponse();
++                        return Task.CompletedTask;
++                    },
++                    // No stack traces or protocol details for the user: the log has them, the page gets a generic error.
++                    OnRemoteFailure = ctx =>
++                    {
++                        ctx.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("SecLab.Gateway.Bff").LogWarning(ctx.Failure, "Sign-in failed");
++                        ctx.Response.Redirect("/login?error=signin_failed");
++                        ctx.HandleResponse();
++                        return Task.CompletedTask;
++                    },
++                };
++            });
++
++        // The stores and clocks come from DI, so they are configured through options.
++        services.AddOptions<CookieAuthenticationOptions>(BffDefaults.CookieScheme).Configure<SessionStore, TimeProvider>((o, store, clock) => { o.SessionStore = store; o.TimeProvider = clock; });
++        services.AddOptions<OpenIdConnectOptions>(BffDefaults.OidcScheme).Configure<TimeProvider>((o, clock) => o.TimeProvider = clock);
++    }
++
++    /// <summary>For requests to /api that carry the session cookie: CSRF rules, then swap the cookie for the session's access token.</summary>
++    public static IApplicationBuilder UseBffSession(this IApplicationBuilder app) => app.Use(async (ctx, next) =>
++    {
++        var req = ctx.Request;
++        var isApi = req.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase);
++        if (!isApi || !req.Cookies.ContainsKey(BffDefaults.CookieName)) { await next(); return; }      // bearer / API-key clients and anonymous callers: untouched
++
++        if (!BffCsrf.Allows(req)) { ctx.Response.StatusCode = StatusCodes.Status403Forbidden; return; }
++
++        var (outcome, token, _) = await ctx.RequestServices.GetRequiredService<SessionTokens>().GetAccessTokenAsync(ctx);
++        switch (outcome)
++        {
++            case TokenOutcome.Ok:
++                req.Headers.Authorization = "Bearer " + token;             // whatever the browser sent as Authorization is replaced, never trusted
++                await next();
++                return;
++            case TokenOutcome.Unavailable:
++                ctx.Response.Headers.RetryAfter = "5";
++                ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
++                return;
++            default:
++                ClearCookie(ctx);
++                ctx.Response.Headers.WWWAuthenticate = "Bearer";
++                ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
++                return;
++        }
++    });
++
++    public static void MapBff(this IEndpointRouteBuilder app)
++    {
++        app.MapGet("/bff/login", (string? returnUrl) =>
++            Results.Challenge(new AuthenticationProperties { RedirectUri = LocalUrl(returnUrl) }, [BffDefaults.OidcScheme]));
++
++        app.MapGet("/bff/user", async (HttpContext ctx) =>
++        {
++            var (session, _) = await ctx.RequestServices.GetRequiredService<SessionTokens>().Resolve(ctx);
++            if (session is null) { ClearCookie(ctx); return Results.Unauthorized(); }
++            ctx.Response.Headers.CacheControl = "no-store";
++            var user = session.Ticket.Principal;
++            // An allow-list of claims for the page to display. Never the principal as a whole, never a token.
++            return Results.Json(new { username = user.FindFirst("preferred_username")?.Value, name = user.FindFirst("name")?.Value, sub = user.FindFirst("sub")?.Value });
++        });
++
++        app.MapPost("/bff/logout", async (HttpContext ctx) =>
++        {
++            if (!BffCsrf.Allows(ctx.Request)) return Results.StatusCode(StatusCodes.Status403Forbidden);
++            var (session, key) = await ctx.RequestServices.GetRequiredService<SessionTokens>().Resolve(ctx);
++            if (session is null || key is null) { ClearCookie(ctx); return Results.Unauthorized(); }
++
++            var properties = new AuthenticationProperties();
++            await ctx.SignOutAsync(BffDefaults.OidcScheme, properties);    // builds the end-session URL (with id_token_hint) into properties
++            ctx.RequestServices.GetRequiredService<SessionStore>().Remove(key);                    // the session is gone on the server ...
++            await ctx.SignOutAsync(BffDefaults.CookieScheme);               // ... and the cookie is cleared in the browser
++            properties.Items.TryGetValue("endSessionUrl", out var url);
++            ctx.Response.Headers.CacheControl = "no-store";
++            return Results.Json(new { endSessionUrl = url });
++        });
++    }
++
++    static string LocalUrl(string? url) =>
++        !string.IsNullOrEmpty(url) && url[0] == '/' && !url.StartsWith("//") && !url.Contains('\\') && !url.Any(char.IsControl) ? url : "/";
++
++    static void ClearCookie(HttpContext ctx)
++    {
++        if (!ctx.Request.Cookies.ContainsKey(BffDefaults.CookieName)) return;          // nothing to clear: visitors without a session get no Set-Cookie at all
++        ctx.Response.Cookies.Delete(BffDefaults.CookieName, new CookieOptions { Secure = true, HttpOnly = true, SameSite = SameSiteMode.Strict, Path = "/" });
++    }
++}
++
++/// <summary>CSRF rules for requests that are authenticated by an ambient credential (the session cookie).</summary>
++public static class BffCsrf
++{
++    public static bool Allows(HttpRequest req)
++    {
++        if (HttpMethods.IsGet(req.Method) || HttpMethods.IsHead(req.Method) || HttpMethods.IsOptions(req.Method)) return true;     // safe methods do not change anything
++        // A custom header cannot be added by a form or an <img>, and a cross-origin fetch with one needs a CORS preflight that this gateway never grants.
++        if (req.Headers[BffDefaults.CsrfHeader] != "1") return false;
++        // Belt and braces: browsers say where a request came from. Anything but our own origin (or no browser context at all) is refused.
++        var site = req.Headers["Sec-Fetch-Site"].ToString();
++        return site is "" or "same-origin" or "none";
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/Bff/BffSettings.cs sol17/backend/src/SecLab.Gateway/Bff/BffSettings.cs
+--- a/backend/src/SecLab.Gateway/Bff/BffSettings.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/Bff/BffSettings.cs	2026-10-04 22:16:58.018681794 +0200
+@@ -0,0 +1,35 @@
++namespace SecLab.Gateway.Bff;
++
++public static class BffDefaults
++{
++    public const string CookieScheme = "bff-cookie";
++    public const string OidcScheme = "bff-oidc";
++    /// <summary>The "__Host-" prefix makes the browser insist on: Secure, Path=/, no Domain attribute (a sibling subdomain cannot overwrite it).</summary>
++    public const string CookieName = "__Host-seclab-session";
++    public const string CallbackPath = "/bff/callback";
++    public const string CsrfHeader = "X-CSRF";
++}
++
++/// <summary>Everything the BFF reads from the "Bff" configuration section. The client secret comes from the environment (Bff__ClientSecret), never from a file in the repository.</summary>
++public sealed record BffSettings(
++    string Authority,
++    string ClientId,
++    string? ClientSecret,
++    string PublicOrigin,
++    TimeSpan IdleTimeout,
++    TimeSpan SessionLifetime,
++    TimeSpan RefreshSkew)
++{
++    public static BffSettings From(IConfiguration configuration)
++    {
++        var s = configuration.GetSection("Bff");
++        return new BffSettings(
++            Authority: s["Authority"] ?? "",
++            ClientId: s["ClientId"] ?? "seclab-bff",
++            ClientSecret: s["ClientSecret"],
++            PublicOrigin: (s["PublicOrigin"] ?? "https://localhost:5173").TrimEnd('/'),
++            IdleTimeout: s.GetValue("IdleTimeout", TimeSpan.FromMinutes(30)),
++            SessionLifetime: s.GetValue("SessionLifetime", TimeSpan.FromHours(8)),
++            RefreshSkew: s.GetValue("RefreshSkew", TimeSpan.FromMinutes(1)));
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/Bff/SessionStore.cs sol17/backend/src/SecLab.Gateway/Bff/SessionStore.cs
+--- a/backend/src/SecLab.Gateway/Bff/SessionStore.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/Bff/SessionStore.cs	2026-10-04 22:19:02.345561050 +0200
+@@ -0,0 +1,83 @@
++using System.Collections.Concurrent;
++using System.Security.Cryptography;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.AspNetCore.Authentication.Cookies;
++
++namespace SecLab.Gateway.Bff;
++
++/// <summary>The tokens of one session. Immutable: a refresh swaps the whole object, so readers never see a half-updated pair.</summary>
++public sealed record TokenSet(string AccessToken, string? RefreshToken, DateTimeOffset ExpiresAt);
++
++public sealed class BffSession(AuthenticationTicket ticket, TokenSet tokens, DateTimeOffset now)
++{
++    long _lastSeenTicks = now.UtcTicks;
++    volatile TokenSet _tokens = tokens;
++
++    public AuthenticationTicket Ticket { get; } = ticket;                  // who the user is (claims); the id_token stays here as the logout hint
++    public TokenSet Tokens { get => _tokens; set => _tokens = value; }     // written only while holding RefreshLock
++    public DateTimeOffset CreatedAt { get; } = now;
++    public DateTimeOffset LastSeen { get => new(Interlocked.Read(ref _lastSeenTicks), TimeSpan.Zero); set => Interlocked.Exchange(ref _lastSeenTicks, value.UtcTicks); }
++    /// <summary>One refresh at a time per session: with refresh-token rotation a second, parallel use of the same refresh token looks like theft to the IdP.</summary>
++    public SemaphoreSlim RefreshLock { get; } = new(1, 1);
++    public volatile bool Removed;
++}
++
++/// <summary>
++/// Server-side sessions for the cookie handler (<see cref="ITicketStore"/>): the cookie carries a random key, everything else – claims and
++/// tokens – stays here. In memory, because the lab has one gateway process; with several instances this belongs in a shared store (Redis, SQL).
++/// Idle timeout and absolute lifetime are enforced here, on every lookup, with the registered <see cref="TimeProvider"/>.
++/// </summary>
++public sealed class SessionStore(TimeProvider clock, BffSettings settings) : ITicketStore
++{
++    public const string KeyItem = ".bff.session";
++    readonly ConcurrentDictionary<string, BffSession> _sessions = new();
++
++    public Task<string> StoreAsync(AuthenticationTicket ticket)
++    {
++        Sweep();
++        var props = ticket.Properties;
++        var access = props.GetTokenValue("access_token") ?? throw new InvalidOperationException("the IdP returned no access token");
++        var expiresAt = DateTimeOffset.TryParse(props.GetTokenValue("expires_at"), System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var e)
++            ? e : clock.GetUtcNow().AddMinutes(1);
++        var tokens = new TokenSet(access, props.GetTokenValue("refresh_token"), expiresAt);
++        // keep only the id_token with the ticket (the end-session request needs it); access and refresh token live in TokenSet
++        var idToken = props.GetTokenValue("id_token");
++        props.StoreTokens(idToken is null ? [] : [new AuthenticationToken { Name = "id_token", Value = idToken }]);
++
++        var key = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');   // 256 random bits: a new identifier at every login
++        props.Items[KeyItem] = key;
++        _sessions[key] = new BffSession(ticket, tokens, clock.GetUtcNow());
++        return Task.FromResult(key);
++    }
++
++    public Task RenewAsync(string key, AuthenticationTicket ticket) => Task.CompletedTask;          // sliding cookies are off: the store, not the cookie, tracks activity
++
++    public Task<AuthenticationTicket?> RetrieveAsync(string key) => Task.FromResult(Touch(key)?.Ticket);
++
++    public Task RemoveAsync(string key) { Remove(key); return Task.CompletedTask; }
++
++    /// <summary>The session behind a key, or null when it never existed, was removed, idled out or reached its absolute lifetime. A hit counts as activity.</summary>
++    public BffSession? Touch(string key)
++    {
++        if (!_sessions.TryGetValue(key, out var s)) return null;
++        var now = clock.GetUtcNow();
++        if (Expired(s, now)) { Remove(key); return null; }
++        s.LastSeen = now;
++        return s;
++    }
++
++    public void Remove(string key)
++    {
++        if (_sessions.TryRemove(key, out var s)) s.Removed = true;
++    }
++
++    bool Expired(BffSession s, DateTimeOffset now) => now - s.CreatedAt >= settings.SessionLifetime || now - s.LastSeen >= settings.IdleTimeout;
++
++    void Sweep()
++    {
++        var now = clock.GetUtcNow();
++        foreach (var (key, s) in _sessions) if (Expired(s, now)) Remove(key);
++    }
++
++    public int Count => _sessions.Count;
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/Bff/SessionTokens.cs sol17/backend/src/SecLab.Gateway/Bff/SessionTokens.cs
+--- a/backend/src/SecLab.Gateway/Bff/SessionTokens.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/Bff/SessionTokens.cs	2026-10-04 22:18:23.357349167 +0200
+@@ -0,0 +1,98 @@
++using System.Globalization;
++using System.Text.Json;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.AspNetCore.Authentication.OpenIdConnect;
++using Microsoft.Extensions.Options;
++
++namespace SecLab.Gateway.Bff;
++
++public enum TokenOutcome { Ok, NoSession, Unavailable }
++
++/// <summary>Hands out the access token of the caller's session and renews it – on the server, with the refresh token the browser never sees.</summary>
++public sealed class SessionTokens(SessionStore store, IOptionsMonitor<OpenIdConnectOptions> oidc, BffSettings settings, TimeProvider clock, ILogger<SessionTokens> log)
++{
++    public async Task<(TokenOutcome Outcome, string? AccessToken, string? Key)> GetAccessTokenAsync(HttpContext ctx)
++    {
++        var (session, key) = await Resolve(ctx);
++        if (session is null || key is null) return (TokenOutcome.NoSession, null, null);
++
++        var tokens = session.Tokens;
++        if (!NeedsRefresh(tokens)) return (TokenOutcome.Ok, tokens.AccessToken, key);
++
++        await session.RefreshLock.WaitAsync(ctx.RequestAborted);
++        try
++        {
++            if (session.Removed) return (TokenOutcome.NoSession, null, key);
++            tokens = session.Tokens;                                       // somebody may have refreshed while we waited for the lock
++            if (!NeedsRefresh(tokens)) return (TokenOutcome.Ok, tokens.AccessToken, key);
++            if (tokens.RefreshToken is null) { store.Remove(key); return (TokenOutcome.NoSession, null, key); }
++
++            var (result, fresh) = await Refresh(tokens, ctx.RequestAborted);
++            switch (result)
++            {
++                case RefreshResult.Refused:                                // invalid_grant & co: the IdP session is over, or this refresh token was already used
++                    store.Remove(key);
++                    return (TokenOutcome.NoSession, null, key);
++                case RefreshResult.Unreachable:
++                    // the old token may still be good for a little while: do not turn an IdP hiccup into a logout
++                    return tokens.ExpiresAt > clock.GetUtcNow() ? (TokenOutcome.Ok, tokens.AccessToken, key) : (TokenOutcome.Unavailable, null, key);
++                default:
++                    session.Tokens = fresh!;                               // rotation: from now on only the NEW refresh token exists
++                    log.LogInformation("Access token refreshed (refresh token rotated: {Rotated})", fresh!.RefreshToken != tokens.RefreshToken);
++                    return (TokenOutcome.Ok, fresh!.AccessToken, key);
++            }
++        }
++        finally { session.RefreshLock.Release(); }
++    }
++
++    /// <summary>Validates the cookie (data protection) and looks the session up in the store.</summary>
++    public async Task<(BffSession? Session, string? Key)> Resolve(HttpContext ctx)
++    {
++        var auth = await ctx.AuthenticateAsync(BffDefaults.CookieScheme);
++        if (!auth.Succeeded || auth.Properties is null || !auth.Properties.Items.TryGetValue(SessionStore.KeyItem, out var key) || key is null) return (null, null);
++        var session = store.Touch(key);
++        return session is null ? (null, null) : (session, key);
++    }
++
++    bool NeedsRefresh(TokenSet t) => t.ExpiresAt - clock.GetUtcNow() <= settings.RefreshSkew;
++
++    enum RefreshResult { Ok, Refused, Unreachable }
++
++    async Task<(RefreshResult, TokenSet?)> Refresh(TokenSet old, CancellationToken ct)
++    {
++        try
++        {
++            var options = oidc.Get(BffDefaults.OidcScheme);
++            var configuration = await options.ConfigurationManager!.GetConfigurationAsync(ct);
++            using var request = new HttpRequestMessage(HttpMethod.Post, configuration.TokenEndpoint)
++            {
++                Content = new FormUrlEncodedContent(new Dictionary<string, string>
++                {
++                    ["grant_type"] = "refresh_token",
++                    ["refresh_token"] = old.RefreshToken!,
++                    ["client_id"] = settings.ClientId,
++                    ["client_secret"] = settings.ClientSecret ?? "",
++                }),
++            };
++            using var response = await options.Backchannel.SendAsync(request, ct);
++            if ((int)response.StatusCode is >= 400 and < 500)
++            {
++                log.LogWarning("The identity provider refused a refresh ({Status}); ending the session", (int)response.StatusCode);
++                return (RefreshResult.Refused, null);
++            }
++            response.EnsureSuccessStatusCode();
++
++            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
++            var root = doc.RootElement;
++            var access = root.GetProperty("access_token").GetString()!;
++            var refresh = root.TryGetProperty("refresh_token", out var r) && r.ValueKind == JsonValueKind.String ? r.GetString() : old.RefreshToken;   // IdP without rotation: keep using the old one
++            var seconds = root.TryGetProperty("expires_in", out var e) && e.TryGetInt32(out var s) ? s : 300;
++            return (RefreshResult.Ok, new TokenSet(access, refresh, clock.GetUtcNow().AddSeconds(seconds)));
++        }
++        catch (Exception ex) when ((ex is HttpRequestException or TaskCanceledException or JsonException or KeyNotFoundException or InvalidOperationException) && !ct.IsCancellationRequested)
++        {
++            log.LogWarning(ex, "Could not refresh the access token");
++            return (RefreshResult.Unreachable, null);
++        }
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/packages.lock.json sol17/backend/src/SecLab.Gateway/packages.lock.json
+--- a/backend/src/SecLab.Gateway/packages.lock.json	2026-10-04 22:13:22.082546973 +0200
++++ b/backend/src/SecLab.Gateway/packages.lock.json	2026-10-04 21:55:56.194189016 +0200
+@@ -2,6 +2,15 @@
+   "version": 1,
+   "dependencies": {
+     "net10.0": {
++      "Microsoft.AspNetCore.Authentication.OpenIdConnect": {
++        "type": "Direct",
++        "requested": "[10.0.12, )",
++        "resolved": "10.0.12",
++        "contentHash": "UfkKr9EP+LBgnFfxwkfnZzta7XkalCroZWoxg2yW9dt8iPXO7bJYpcmyFIeM+FLcAlOKZeduP93XhuCcfWaYIQ==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Protocols.OpenIdConnect": "8.19.2"
++        }
++      },
+       "Yarp.ReverseProxy": {
+         "type": "Direct",
+         "requested": "[2.3.0, )",
+@@ -11,6 +20,67 @@
+           "System.IO.Hashing": "8.0.0"
+         }
+       },
++      "Microsoft.Bcl.Cryptography": {
++        "type": "Transitive",
++        "resolved": "10.0.2",
++        "contentHash": "LG9Yll3B5aNpxv0+D47g6LiOiKBIlodhcHdQwcYzo8VeexFLGqx5ymetmA2aBRyo9cCcWsQWrFsdbsr8LvmWDw=="
++      },
++      "Microsoft.IdentityModel.Abstractions": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "HJbo/lnSfNHUfphPRT910poQc4T2/9+8svFLvzuaYHGAOJ2Tu+oEDqpX0BVP3BJ4OuUM1kylEKyaiX2fCAK3Cw=="
++      },
++      "Microsoft.IdentityModel.JsonWebTokens": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "ui3fuBT4fs8kdKfBthI4NzLYIBIneEVS8UrL1JVBzAn80UiKmngBBi0BEByE7n/9c+EElcfFlCMFFTqpkBSLNA==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Tokens": "8.19.2"
++        }
++      },
++      "Microsoft.IdentityModel.Logging": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "r5YLDIxGOnkVJHrqXv/iD1FM1CgGrQOdriXuvuWvTPmKbnGANhEysq9XKmN6IHjf2a+9bAGEpnoRBsAQlvJU5w==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Abstractions": "8.19.2"
++        }
++      },
++      "Microsoft.IdentityModel.Protocols": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "sGxSsSrZXNmca6D+jHH2rVRyo2nNRd/g4H9CFbPmLLq0xgoH1U0orLWE5minfijw7+zq49tBs7txenbfAErRoQ==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Tokens": "8.19.2"
++        }
++      },
++      "Microsoft.IdentityModel.Protocols.OpenIdConnect": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "1XOcyY36cVymzE3qKdzKaUEZ4Pzt7ZpSa14JZoPPK1NLFUkQDs85TCqpV6XDo0YjFXj6nVK00AfOHppjghjhtw==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Protocols": "8.19.2",
++          "System.IdentityModel.Tokens.Jwt": "8.19.2"
++        }
++      },
++      "Microsoft.IdentityModel.Tokens": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "GtPC1S02uH1gOO4fQ+zRysIicKmEXaYFP8PIkdJYXqMyruYhopre4ozVHp0XiDSA0+GJvOZH9prxCPvgBMg4Ww==",
++        "dependencies": {
++          "Microsoft.Bcl.Cryptography": "10.0.2",
++          "Microsoft.IdentityModel.Logging": "8.19.2"
++        }
++      },
++      "System.IdentityModel.Tokens.Jwt": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "gqhDC/icByKEutygpr+OFgAmjwTVowyzFjWB8K0q1ww8uFj5a1BQNL+QvijUl9uhq4p8OdDwcAIrjVC+eC9FVA==",
++        "dependencies": {
++          "Microsoft.IdentityModel.JsonWebTokens": "8.19.2",
++          "Microsoft.IdentityModel.Tokens": "8.19.2"
++        }
++      },
+       "System.IO.Hashing": {
+         "type": "Transitive",
+         "resolved": "8.0.0",
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/Program.cs sol17/backend/src/SecLab.Gateway/Program.cs
+--- a/backend/src/SecLab.Gateway/Program.cs	2026-10-04 22:13:22.082573703 +0200
++++ b/backend/src/SecLab.Gateway/Program.cs	2026-10-04 21:58:20.137442721 +0200
+@@ -3,6 +3,7 @@
+ using System.Threading.RateLimiting;
+ using Microsoft.AspNetCore.Mvc;
+ using Microsoft.AspNetCore.RateLimiting;
++using SecLab.Gateway.Bff;
+ using Yarp.ReverseProxy.Transforms;
+ 
+ var builder = WebApplication.CreateBuilder(args);
+@@ -39,6 +40,8 @@
+     };
+ });
+ 
++builder.AddBff();                                                  // step 17: sessions, OIDC login, token refresh
++
+ builder.Services.AddReverseProxy()
+     .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"))
+     .AddTransforms(ctx => ctx.AddRequestTransform(t =>
+@@ -95,6 +98,17 @@
+         if (ip is null || !adminNetworks.Any(n => n.Contains(ip))) { ctx.Response.StatusCode = StatusCodes.Status404NotFound; return; }
+     }
+ 
++    await next();
++});
++
++// Step 17: the OIDC callback is handled in here; then requests carrying the session cookie get their Bearer token (and CSRF checks).
++app.UseAuthentication();
++app.UseBffSession();
++
++app.Use(async (ctx, next) =>
++{
++    var req = ctx.Request;
++
+     // Coarse authentication: a request to a protected API area must carry *some* credential of a supported type.
+     // The API still validates it properly (signature, issuer, audience, lifetime, scopes, ownership ...).
+     var isPublic = req.Path.StartsWithSegments("/api/auth", StringComparison.OrdinalIgnoreCase) || HttpMethods.IsOptions(req.Method);
+@@ -108,6 +122,7 @@
+     await next();
+ });
+ 
++app.MapBff();
+ app.MapReverseProxy();
+ app.Run();
+ 
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/src/SecLab.Gateway/SecLab.Gateway.csproj sol17/backend/src/SecLab.Gateway/SecLab.Gateway.csproj
+--- a/backend/src/SecLab.Gateway/SecLab.Gateway.csproj	2026-10-04 22:13:22.082607546 +0200
++++ b/backend/src/SecLab.Gateway/SecLab.Gateway.csproj	2026-10-04 21:55:56.188728894 +0200
+@@ -5,6 +5,7 @@
+     <ImplicitUsings>enable</ImplicitUsings>
+   </PropertyGroup>
+   <ItemGroup>
++    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.12" />
+     <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
+   </ItemGroup>
+ </Project>
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/backend/tests/SecLab.Gateway.Tests/packages.lock.json sol17/backend/tests/SecLab.Gateway.Tests/packages.lock.json
+--- a/backend/tests/SecLab.Gateway.Tests/packages.lock.json	2026-10-04 22:13:22.082673439 +0200
++++ b/backend/tests/SecLab.Gateway.Tests/packages.lock.json	2026-10-04 21:58:27.120759189 +0200
+@@ -40,11 +40,24 @@
+         "resolved": "3.1.0",
+         "contentHash": "K9O9TOzugqOo4LJ87uuq1VG8RAqGp20Ng85Wx932oT5LNBkIgeeGYubVW5UMnOOTanFNbGavmbuYrJr4INzSwg=="
+       },
++      "Microsoft.AspNetCore.Authentication.OpenIdConnect": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "UfkKr9EP+LBgnFfxwkfnZzta7XkalCroZWoxg2yW9dt8iPXO7bJYpcmyFIeM+FLcAlOKZeduP93XhuCcfWaYIQ==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Protocols.OpenIdConnect": "8.19.2"
++        }
++      },
+       "Microsoft.AspNetCore.TestHost": {
+         "type": "Transitive",
+         "resolved": "10.0.12",
+         "contentHash": "bTHgbcjSrLxlqSasYRDU9BcJ3hDGoqIjtDY0soLNrndOWi3kxtOyddwUMaNZgtoI2Uf6y7ZQs2EuVj0c20B7mA=="
+       },
++      "Microsoft.Bcl.Cryptography": {
++        "type": "Transitive",
++        "resolved": "10.0.2",
++        "contentHash": "LG9Yll3B5aNpxv0+D47g6LiOiKBIlodhcHdQwcYzo8VeexFLGqx5ymetmA2aBRyo9cCcWsQWrFsdbsr8LvmWDw=="
++      },
+       "Microsoft.CodeCoverage": {
+         "type": "Transitive",
+         "resolved": "17.14.1",
+@@ -334,6 +347,54 @@
+         "resolved": "10.0.12",
+         "contentHash": "dYfCLR52UA+3DL7C4I/pvSaRPkNqxrUAQmbFL2u0zvYKKzqgrFCJl08Df+F1aYc8leu9JvpC9bsURUdpExcBXQ=="
+       },
++      "Microsoft.IdentityModel.Abstractions": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "HJbo/lnSfNHUfphPRT910poQc4T2/9+8svFLvzuaYHGAOJ2Tu+oEDqpX0BVP3BJ4OuUM1kylEKyaiX2fCAK3Cw=="
++      },
++      "Microsoft.IdentityModel.JsonWebTokens": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "ui3fuBT4fs8kdKfBthI4NzLYIBIneEVS8UrL1JVBzAn80UiKmngBBi0BEByE7n/9c+EElcfFlCMFFTqpkBSLNA==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Tokens": "8.19.2"
++        }
++      },
++      "Microsoft.IdentityModel.Logging": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "r5YLDIxGOnkVJHrqXv/iD1FM1CgGrQOdriXuvuWvTPmKbnGANhEysq9XKmN6IHjf2a+9bAGEpnoRBsAQlvJU5w==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Abstractions": "8.19.2"
++        }
++      },
++      "Microsoft.IdentityModel.Protocols": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "sGxSsSrZXNmca6D+jHH2rVRyo2nNRd/g4H9CFbPmLLq0xgoH1U0orLWE5minfijw7+zq49tBs7txenbfAErRoQ==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Tokens": "8.19.2"
++        }
++      },
++      "Microsoft.IdentityModel.Protocols.OpenIdConnect": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "1XOcyY36cVymzE3qKdzKaUEZ4Pzt7ZpSa14JZoPPK1NLFUkQDs85TCqpV6XDo0YjFXj6nVK00AfOHppjghjhtw==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Protocols": "8.19.2",
++          "System.IdentityModel.Tokens.Jwt": "8.19.2"
++        }
++      },
++      "Microsoft.IdentityModel.Tokens": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "GtPC1S02uH1gOO4fQ+zRysIicKmEXaYFP8PIkdJYXqMyruYhopre4ozVHp0XiDSA0+GJvOZH9prxCPvgBMg4Ww==",
++        "dependencies": {
++          "Microsoft.Bcl.Cryptography": "10.0.2",
++          "Microsoft.Extensions.Logging.Abstractions": "8.0.0",
++          "Microsoft.IdentityModel.Logging": "8.19.2"
++        }
++      },
+       "Microsoft.TestPlatform.ObjectModel": {
+         "type": "Transitive",
+         "resolved": "17.14.1",
+@@ -358,6 +419,15 @@
+         "resolved": "10.0.12",
+         "contentHash": "sOZM+VyRj1pg/ItlHsvrSbjws6oGqZveTzTNBGZ9ziwRDyKsOF3ub6vhvOdxotCIqtlnyHAIwP5sLNvgiZC+pQ=="
+       },
++      "System.IdentityModel.Tokens.Jwt": {
++        "type": "Transitive",
++        "resolved": "8.19.2",
++        "contentHash": "gqhDC/icByKEutygpr+OFgAmjwTVowyzFjWB8K0q1ww8uFj5a1BQNL+QvijUl9uhq4p8OdDwcAIrjVC+eC9FVA==",
++        "dependencies": {
++          "Microsoft.IdentityModel.JsonWebTokens": "8.19.2",
++          "Microsoft.IdentityModel.Tokens": "8.19.2"
++        }
++      },
+       "System.IO.Hashing": {
+         "type": "Transitive",
+         "resolved": "8.0.0",
+@@ -414,6 +484,7 @@
+       "seclab.gateway": {
+         "type": "Project",
+         "dependencies": {
++          "Microsoft.AspNetCore.Authentication.OpenIdConnect": "[10.0.12, )",
+           "Yarp.ReverseProxy": "[2.3.0, )"
+         }
+       }
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/docs/00-overview-and-threat-model.md sol17/docs/00-overview-and-threat-model.md
+--- a/docs/00-overview-and-threat-model.md	2026-10-04 22:13:22.084968692 +0200
++++ b/docs/00-overview-and-threat-model.md	2026-10-04 22:09:09.531631380 +0200
+@@ -23,7 +23,7 @@
+ | W12 | No rate limiting | all | 07 |
+ | W13 | No versioning | all routes | 08 |
+ | W14 | DB accessed as `sa` with a weak committed password | `appsettings.json`, `docker-compose.yml` | 15 |
+-| W15 | Token in `localStorage` | frontend | 03 |
++| W15 | Token in `localStorage` (step 03 moved it to `sessionStorage`: still readable by any script in the page) | frontend | 03, 17 |
+ | W16 | "Check, then insert" races: duplicate usernames, `500` on a concurrent duplicate like (not listed in the starter; found by step 16's concurrency tests) | `POST /api/auth/register`, `POST /api/blogs/{id}/like`, `Users` table | 16 |
+ 
+ ## Try the baseline attacks
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/docs/owasp-matrix.md sol17/docs/owasp-matrix.md
+--- a/docs/owasp-matrix.md	2026-10-04 22:13:22.084999569 +0200
++++ b/docs/owasp-matrix.md	2026-10-04 22:09:09.531681233 +0200
+@@ -20,7 +20,7 @@
+ | A04 | Cryptographic Failures | Passwords at rest, TLS in transit, API-key digests, DB columns holding phone/address | Step 01 TLS 1.2+, HSTS; step 02 PBKDF2 hashing; step 06 hashed keys; step 15 verified TLS to SQL Server and encrypted phone/address columns. Left: the Data Protection key ring is an unprotected file (vault/HSM in Part 2), no Always Encrypted | Step=15 | Partial |
+ | A05 | Injection | `/api/blogs/search` built SQL by concatenation (fixed); HTML in blog bodies (XSS) | Step 10 validation + HTML sanitising; step 15 parameterised search, EF1002/EF1003 build errors, app login without DDL rights (blast radius) | Step=15 | Mitigated |
+ | A06 | Insecure Design | Trust assumptions: client-chosen identity, unlimited friends/likes, no abuse limits, unversioned API | Steps 03/05 (identity from tokens), 07 rate limits, 08 versioning and retirement, 04 step-up for destructive actions; step 16: "check, then insert" races closed by a unique index on `Users.Username` and idempotent likes (found by concurrency tests) | Step=04, Step=16 | Mitigated |
+-| A07 | Authentication Failures | Login, registration, API keys, tokens, WebAuthn | Step 02 hashing/lockout/uniform failures, step 03 OIDC + PKCE, step 04 passkeys, step 06 keys, step 07 throttling | Step=03 | Mitigated |
++| A07 | Authentication Failures | Login, registration, API keys, tokens, WebAuthn | Step 02 hashing/lockout/uniform failures, step 03 OIDC + PKCE, step 04 passkeys, step 06 keys, step 07 throttling; step 17: the browser never holds a token - the gateway is a confidential OIDC client with server-side sessions (HttpOnly `__Host-` cookie, idle and absolute timeouts, server-side refresh with rotation, logout that ends the IdP session) and CSRF protection | Step=03, `backend/tests/SecLab.Gateway.Tests/Step17BffTests.cs` | Mitigated |
+ | A08 | Software or Data Integrity Failures | Blog HTML from users, JWT signature validation, dependency and CI artefacts | Step 03 signature/issuer/audience validation, step 10 sanitising, step 13 lock files; signed images and pipeline integrity in Part 2 | Step=03 | Partial |
+ | A09 | Security Logging and Alerting Failures | Login, key, admin and denial events; alerting on abuse | Step 12 audit events, metrics, correlation and the detection exercise; central storage and alert rules in Part 2 | Step=12 | Partial |
+ | A10 | Mishandling of Exceptional Conditions | Unhandled exceptions, crash route, half-failed operations (account deletion), failing checks | Step 11 global handler, uniform problem details, fail-closed authorization; audit and metrics for 5xx in step 12 | Step=11 | Mitigated |
+@@ -30,12 +30,12 @@
+ | ID | Title | Where / how in SecLab | Mitigation | Evidence | Status |
+ |----|-------|-----------------------|------------|----------|--------|
+ | API1 | Broken Object Level Authorization | Any endpoint taking a user or blog id: profile, friends, likes, blogs, keys | Step 05 loads then authorises every object; tests create their own users and try cross-access; step 16: authorization matrix (every route x caller) and negative tests, guarded by mutants | Step=05, Step=16 | Mitigated |
+-| API2 | Broken Authentication | `/api/auth/*`, bearer validation, API keys, passkeys | Steps 02, 03, 04, 06 | Step=03 | Mitigated |
++| API2 | Broken Authentication | `/api/auth/*`, bearer validation, API keys, passkeys, the SPA's session | Steps 02, 03, 04, 06; step 17 moves tokens out of the browser (BFF session cookie, CSRF header, server-side refresh) | Step=03, `docs/attack-scripts/17-bff-probes.sh` | Mitigated |
+ | API3 | Broken Object Property Level Authorization | `GET/PUT /api/users/{id}` returned and accepted whole entities incl. role and password | Step 05 three response shapes and an input DTO; step 10 constraints | Step=05 | Mitigated |
+ | API4 | Unrestricted Resource Consumption | Unbounded `/api/blogs`, uploads, request bodies, login floods | Step 07 rate limits, step 08 bounded pages (v2), step 09 upload and body caps, step 10 length limits | Step=07 | Mitigated |
+ | API5 | Broken Function Level Authorization | `/api/admin/*`, `/api/debug/*`, partner routes with key levels | Step 05 Admin policy, step 06 levels, step 09 admin network requirement; step 16: the matrix fails when a route is unclassified or the Admin policy stops working | Step=06, Step=16 | Mitigated |
+ | API6 | Unrestricted Access to Sensitive Business Flows | Registration and login abuse (mass account creation, credential stuffing), like/blog spam | Step 07 per-IP limits and lockout, step 12 detection; no CAPTCHA or per-user post quotas yet | Step=07 | Partial |
+ | API7 | Server Side Request Forgery | `POST /api/tools/link-preview` fetches user-chosen URLs | Step 09: https-only exact host allow-list, no redirects, connect-time address check, size and time caps | Step=09 | Mitigated |
+-| API8 | Security Misconfiguration | CORS, headers, error pages, dev tooling, server banner | Steps 01, 09, 11, 13 | Step=13 | Mitigated |
++| API8 | Security Misconfiguration | CORS, headers, error pages, dev tooling, server banner, cookie attributes | Steps 01, 09, 11, 13; step 17: cookie flags are tested (HttpOnly, Secure, SameSite, `__Host-`), the SPA CSP lost its API/IdP origins and gained COOP/CORP, the API cannot set cookies through the gateway | Step=13, `frontend/tests/step17-bff.test.ts` | Mitigated |
+ | API9 | Improper Inventory Management | Deprecated v1, debug routes, health endpoints, undocumented routes | Step 08 versions with sunset and 410; step 13 test lists every anonymous endpoint and requires all `/api` routes to be in the version set; step 16: the authorization matrix also fails for any route that is not in its table | Step=13, Step=16 | Mitigated |
+ | API10 | Unsafe Consumption of APIs | Link-preview responses and the ExternalApi service consumed by the API | Step 09 treats fetched content as untrusted text with size limits; consumer-side contract tests for outbound calls were not added in step 16 (the connect-time address check refuses a local fake upstream; see its solution notes) | Step=09 | Partial |
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/package.json sol17/frontend/package.json
+--- a/frontend/package.json	2026-10-04 22:13:22.079683090 +0200
++++ b/frontend/package.json	2026-10-04 22:00:24.776478200 +0200
+@@ -13,7 +13,6 @@
+   "dependencies": {
+     "@simplewebauthn/browser": "^14.0.0",
+     "dompurify": "^3.4.16",
+-    "oidc-client-ts": "^3.5.0",
+     "react": "^19.2.8",
+     "react-dom": "^19.2.8",
+     "react-router-dom": "^7.18.4"
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/package-lock.json sol17/frontend/package-lock.json
+--- a/frontend/package-lock.json	2026-10-04 22:13:22.079746539 +0200
++++ b/frontend/package-lock.json	2026-10-04 22:00:24.787478143 +0200
+@@ -10,7 +10,6 @@
+       "dependencies": {
+         "@simplewebauthn/browser": "^14.0.0",
+         "dompurify": "^3.4.16",
+-        "oidc-client-ts": "^3.5.0",
+         "react": "^19.2.8",
+         "react-dom": "^19.2.8",
+         "react-router-dom": "^7.18.4"
+@@ -1433,15 +1432,6 @@
+         }
+       }
+     },
+-    "node_modules/jwt-decode": {
+-      "version": "4.0.0",
+-      "resolved": "https://registry.npmjs.org/jwt-decode/-/jwt-decode-4.0.0.tgz",
+-      "integrity": "sha512-+KJGIyHgkGuIq3IEBNftfhW/LfWhXUIY6OmyVWjliu5KH1y0fw7VQ8YndE2O4qZdMSd9SqbnC8GOcZEy0Om7sA==",
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=18"
+-      }
+-    },
+     "node_modules/lightningcss": {
+       "version": "1.33.0",
+       "resolved": "https://registry.npmjs.org/lightningcss/-/lightningcss-1.33.0.tgz",
+@@ -1785,18 +1775,6 @@
+         "node": ">=12.20.0"
+       }
+     },
+-    "node_modules/oidc-client-ts": {
+-      "version": "3.5.0",
+-      "resolved": "https://registry.npmjs.org/oidc-client-ts/-/oidc-client-ts-3.5.0.tgz",
+-      "integrity": "sha512-l2q8l9CTCTOlbX+AnK4p3M+4CEpKpyQhle6blQkdFhm0IsBqsxm15bYaSa11G7pWdsYr6epdsRZxJpCyCRbT8A==",
+-      "license": "Apache-2.0",
+-      "dependencies": {
+-        "jwt-decode": "^4.0.0"
+-      },
+-      "engines": {
+-        "node": ">=18"
+-      }
+-    },
+     "node_modules/oxlint": {
+       "version": "1.86.0",
+       "resolved": "https://registry.npmjs.org/oxlint/-/oxlint-1.86.0.tgz",
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/src/api/auth.ts sol17/frontend/src/api/auth.ts
+--- a/frontend/src/api/auth.ts	2026-10-04 22:13:22.075488995 +0200
++++ b/frontend/src/api/auth.ts	1970-01-01 01:00:00.000000000 +0100
+@@ -1,14 +0,0 @@
+-import { UserManager, WebStorageStateStore } from 'oidc-client-ts'
+-
+-// Authorization Code flow with PKCE against Keycloak. The SPA is a *public* client: no client secret.
+-export const userManager = new UserManager({
+-  authority: 'http://localhost:8081/realms/seclab',
+-  client_id: 'seclab-spa',
+-  redirect_uri: `${window.location.origin}/callback`,
+-  post_logout_redirect_uri: window.location.origin,
+-  response_type: 'code',
+-  scope: 'openid profile email',
+-  // Tokens live in sessionStorage (gone when the tab closes). Still readable by any script running in the
+-  // page (XSS) - see the token-storage discussion in docs/03; a BFF avoids it.
+-  userStore: new WebStorageStateStore({ store: window.sessionStorage }),
+-})
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/src/api/client.ts sol17/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-10-04 22:13:22.080436907 +0200
++++ b/frontend/src/api/client.ts	2026-10-04 22:00:24.615841174 +0200
+@@ -1,8 +1,8 @@
+-import { userManager } from './auth'
+-
+ // Single place for all HTTP calls. Later tutorial steps change auth, base URL and versioning here.
+ export const API_VERSION = '2.0'
+-export const API_BASE = 'https://localhost:5443'
++// Same origin as the page: the dev/preview server (and in production the host of the SPA) forwards /bff, /api and /avatars to the gateway.
++// The browser holds one HttpOnly session cookie that this code can neither read nor send by hand; there are no tokens in JavaScript.
++export const API_BASE = ''
+ 
+ export interface User {
+   id: number; username: string; displayName: string; email: string; phone: string
+@@ -13,12 +13,32 @@
+   title: string; body: string; createdAt: string; likes: number
+ }
+ 
+-// The signed-in local user is cached for display only; authority is the access token, never this object.
+-export const setSession = (user: User) => sessionStorage.setItem('me', JSON.stringify(user))
+-export const clearSession = () => sessionStorage.removeItem('me')
+-export const currentUser = (): User | null => {
+-  const raw = sessionStorage.getItem('me')
+-  return raw ? JSON.parse(raw) : null
++// The signed-in local user lives in memory, for display only; authority is the server-side session behind the cookie. A reload asks the server again.
++let me: User | null = null
++export const setSession = (user: User) => { me = user }
++export const clearSession = () => { me = null }
++export const currentUser = (): User | null => me
++
++// The custom header makes every state-changing request something a foreign site cannot send (CSRF); the gateway insists on it.
++const CSRF = { 'X-CSRF': '1' }
++
++/** Called once before the first render: is there a session, and who is it? */
++export async function loadSession(): Promise<void> {
++  try {
++    const res = await fetch('/bff/user', { headers: CSRF })
++    if (!res.ok) { clearSession(); return }                 // 401: not signed in
++    setSession(await api.me())
++  } catch { clearSession() }
++}
++
++/** Ends the session on the server, then lets the identity provider end its own. */
++export async function logout(): Promise<void> {
++  let endSessionUrl: string | null = null
++  try {
++    const res = await fetch('/bff/logout', { method: 'POST', headers: CSRF })
++    if (res.ok) endSessionUrl = (await res.json()).endSessionUrl
++  } finally { clearSession() }
++  window.location.assign(endSessionUrl ?? '/login')
+ }
+ 
+ export class ApiError extends Error {
+@@ -43,10 +63,10 @@
+ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+   const headers = new Headers(init.headers)
+   headers.set('api-version', API_VERSION)          // always say which contract we speak
+-  const oidcUser = await userManager.getUser()
+-  if (oidcUser && !oidcUser.expired) headers.set('Authorization', `Bearer ${oidcUser.access_token}`)
++  headers.set('X-CSRF', '1')
+   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json')
+-  const res = await fetch(API_BASE + path, { ...init, headers })
++  const res = await fetch(API_BASE + path, { ...init, headers, credentials: 'same-origin' })
++  if (res.status === 401) { clearSession(); window.location.assign('/login'); throw new ApiError(401, 'Your session has ended - please log in again.') }
+   if (res.status === 429) {
+     const wait = res.headers.get('Retry-After')
+     throw new Error(`Too many requests - please wait ${wait ?? 'a moment'} seconds and try again.`)
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/src/App.tsx sol17/frontend/src/App.tsx
+--- a/frontend/src/App.tsx	2026-10-04 22:13:22.075528288 +0200
++++ b/frontend/src/App.tsx	2026-10-04 22:00:24.615883914 +0200
+@@ -1,12 +1,10 @@
+ import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom'
+ import Login from './pages/Login'
+-import Callback from './pages/Callback'
+ import Profile from './pages/Profile'
+ import Personal from './pages/Personal'
+ import Timeline from './pages/Timeline'
+ import Experience from './pages/Experience'
+-import { clearSession, currentUser } from './api/client'
+-import { userManager } from './api/auth'
++import { currentUser, logout } from './api/client'
+ 
+ function Guard({ children }: { children: React.ReactElement }) {
+   return currentUser() ? children : <Navigate to="/login" />
+@@ -23,7 +21,7 @@
+       <NavLink to="/experience">Experience</NavLink>
+       <span className="spacer" />
+       <span>{user.displayName}</span>
+-      <button onClick={async () => { clearSession(); await userManager.signoutRedirect() }}>Log out</button>
++      <button onClick={logout}>Log out</button>
+     </nav>
+   )
+ }
+@@ -35,7 +33,6 @@
+       <main>
+         <Routes>
+           <Route path="/login" element={<Login />} />
+-          <Route path="/callback" element={<Callback />} />
+           <Route path="/profile" element={<Guard><Profile /></Guard>} />
+           <Route path="/personal" element={<Guard><Personal /></Guard>} />
+           <Route path="/timeline" element={<Guard><Timeline /></Guard>} />
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/src/main.tsx sol17/frontend/src/main.tsx
+--- a/frontend/src/main.tsx	2026-09-30 10:20:56.668924153 +0200
++++ b/frontend/src/main.tsx	2026-10-04 22:00:24.615937935 +0200
+@@ -2,5 +2,7 @@
+ import { createRoot } from 'react-dom/client'
+ import './index.css'
+ import App from './App'
++import { loadSession } from './api/client'
+ 
+-createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>)
++// Ask the server who is signed in (the cookie is sent automatically) before the first render.
++loadSession().finally(() => createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>))
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/src/pages/Callback.tsx sol17/frontend/src/pages/Callback.tsx
+--- a/frontend/src/pages/Callback.tsx	2026-10-04 22:13:22.075544228 +0200
++++ b/frontend/src/pages/Callback.tsx	1970-01-01 01:00:00.000000000 +0100
+@@ -1,15 +0,0 @@
+-import { useEffect } from 'react'
+-import { useNavigate } from 'react-router-dom'
+-import { api, setSession } from '../api/client'
+-import { userManager } from '../api/auth'
+-
+-export default function Callback() {
+-  const nav = useNavigate()
+-  useEffect(() => {
+-    userManager.signinRedirectCallback()
+-      .then(() => api.me())
+-      .then(me => { setSession(me); nav('/profile', { replace: true }) })
+-      .catch(() => nav('/login', { replace: true }))
+-  }, [nav])
+-  return <p>Signing you in…</p>
+-}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/src/pages/Login.tsx sol17/frontend/src/pages/Login.tsx
+--- a/frontend/src/pages/Login.tsx	2026-10-04 22:13:22.075560348 +0200
++++ b/frontend/src/pages/Login.tsx	2026-10-04 22:00:24.615860560 +0200
+@@ -1,10 +1,13 @@
+-import { userManager } from '../api/auth'
++import { useSearchParams } from 'react-router-dom'
+ 
+ export default function Login() {
++  const [params] = useSearchParams()
+   return (
+     <div className="card narrow">
+       <h2>Log in</h2>
+-      <button onClick={() => userManager.signinRedirect()}>Log in with Keycloak</button>
++      {params.get('error') && <p role="alert">Sign-in did not work. Please try again.</p>}
++      {/* A full-page navigation to the BFF: the gateway runs the OIDC flow and sets the session cookie. Nothing is stored in the page. */}
++      <button onClick={() => window.location.assign('/bff/login?returnUrl=' + encodeURIComponent('/profile'))}>Log in with Keycloak</button>
+       <small>Seed users: alice, bob, carol, dave, eve — password123</small>
+     </div>
+   )
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/src/pages/Profile.tsx sol17/frontend/src/pages/Profile.tsx
+--- a/frontend/src/pages/Profile.tsx	2026-10-04 22:13:22.077359926 +0200
++++ b/frontend/src/pages/Profile.tsx	2026-10-04 22:00:24.615930090 +0200
+@@ -1,7 +1,6 @@
+ import { useEffect, useState } from 'react'
+ import { startAuthentication, startRegistration } from '@simplewebauthn/browser'
+-import { userManager } from '../api/auth'
+-import { api, API_BASE, currentUser, setSession, type User } from '../api/client'
++import { api, API_BASE, currentUser, logout, setSession, type User } from '../api/client'
+ 
+ export default function Profile() {
+   const me = currentUser()!
+@@ -53,7 +52,7 @@
+     const assertion = await startAuthentication({ optionsJSON })     // step-up: prove it is really you, right now
+     const { stepUpToken } = await api.assertComplete(assertion)
+     await api.deleteAccount(stepUpToken)
+-    await userManager.signoutRedirect()
++    await logout()
+   }
+ 
+   return (
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/tests/headers.test.ts sol17/frontend/tests/headers.test.ts
+--- a/frontend/tests/headers.test.ts	2026-09-30 12:11:45.741111141 +0200
++++ b/frontend/tests/headers.test.ts	2026-10-04 22:00:33.340567909 +0200
+@@ -22,8 +22,8 @@
+     expect(csp['frame-ancestors']).toEqual(["'none'"])
+     expect(csp['form-action']).toEqual(["'self'"])
+   })
+-  it('allows connections only to the API and the identity provider', () => {
+-    expect([...csp['connect-src']].sort()).toEqual(["'self'", 'http://localhost:8081', 'https://localhost:5443'].sort())
++  it('allows connections only to its own origin (step 17: the BFF is same-origin; no API or IdP origin any more)', () => {
++    expect(csp['connect-src']).toEqual(["'self'"])
+   })
+   it('sets the companion headers', () => {
+     expect(headers['X-Content-Type-Options']).toBe('nosniff')
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid17/frontend/vite.config.ts sol17/frontend/vite.config.ts
+--- a/frontend/vite.config.ts	2026-10-04 22:13:22.082122672 +0200
++++ b/frontend/vite.config.ts	2026-10-04 22:00:33.340533445 +0200
+@@ -7,17 +7,21 @@
+   ? { cert: fs.readFileSync('../certs/dev.pem'), key: fs.readFileSync('../certs/dev.key') }
+   : undefined
+ 
++// Step 17: the SPA and the BFF share one origin. The browser only talks to this server; /bff, /api and /avatars are forwarded to the
++// gateway, so the session cookie is first-party, no CORS is involved, and the page never contacts the gateway or the identity provider itself.
++// (In production the host of the static files does the same job: a reverse proxy, or the gateway.)
++const gateway = { target: 'https://localhost:5443', secure: false /* the dev certificate */ }
++const proxy = { '/bff': gateway, '/api': gateway, '/avatars': gateway }
++
+ // The production build is static files; whoever serves them (`vite preview` here, a CDN or the gateway later) must send these headers.
+ // The dev server cannot use this CSP: hot reload injects inline scripts.
+-const API = 'https://localhost:5443'
+-const IDP = 'http://localhost:8081'
+ const securityHeaders = {
+   'Content-Security-Policy': [
+     "default-src 'self'",
+     "script-src 'self'",
+     "style-src 'self'",
+-    `connect-src 'self' ${API} ${IDP}`,
+-    `img-src 'self' ${API} https://i.pravatar.cc data:`,
++    "connect-src 'self'",                       // only our own origin: the page never calls the gateway or the IdP directly any more
++    "img-src 'self' https://i.pravatar.cc data:",
+     "object-src 'none'",
+     "base-uri 'none'",
+     "form-action 'self'",
+@@ -26,11 +30,13 @@
+   'X-Content-Type-Options': 'nosniff',
+   'Referrer-Policy': 'no-referrer',
+   'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
++  'Cross-Origin-Opener-Policy': 'same-origin',       // no other window can hold a reference to this one
++  'Cross-Origin-Resource-Policy': 'same-origin',
+ }
+ 
+ export default defineConfig({
+   plugins: [react()],
+   test: { environment: 'jsdom', include: ['tests/**/*.test.{ts,tsx}'] },
+-  server: { port: 5173, https },
+-  preview: { port: 4173, https, headers: securityHeaders },
++  server: { port: 5173, https, proxy },
++  preview: { port: 4173, https, headers: securityHeaders, proxy },
+ })

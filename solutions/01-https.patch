@@ -1,0 +1,84 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' orig/backend/src/SecLab.Api/Program.cs sol/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 10:18:07.191428772 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 10:46:03.425853376 +0200
+@@ -4,14 +4,22 @@
+ 
+ var builder = WebApplication.CreateBuilder(args);
+ 
++// Only allow modern TLS on every HTTPS endpoint Kestrel opens.
++builder.WebHost.ConfigureKestrel(k => k.ConfigureHttpsDefaults(h =>
++    h.SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13));
++
+ builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
+ // WEAKNESS: wide-open CORS.
+ builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+ 
++builder.Services.AddHsts(o => { o.MaxAge = TimeSpan.FromDays(365); o.IncludeSubDomains = true; });
++
+ var app = builder.Build();
+ 
+ // WEAKNESS: developer exception page always on (leaks stack traces), plain HTTP only.
+ app.UseDeveloperExceptionPage();
++if (!app.Environment.IsDevelopment()) app.UseHsts();   // browsers remember: HTTPS only (skipped on localhost by design)
++app.UseHttpsRedirection();
+ app.UseCors();
+ app.UseStaticFiles();
+ 
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' orig/backend/src/SecLab.Api/Properties/launchSettings.json sol/backend/src/SecLab.Api/Properties/launchSettings.json
+--- a/backend/src/SecLab.Api/Properties/launchSettings.json	2026-09-30 10:14:49.994057924 +0200
++++ b/backend/src/SecLab.Api/Properties/launchSettings.json	2026-09-30 10:45:44.733675168 +0200
+@@ -3,7 +3,7 @@
+     "http": {
+       "commandName": "Project",
+       "launchBrowser": false,
+-      "applicationUrl": "http://localhost:5080",
++      "applicationUrl": "https://localhost:5443;http://localhost:5080",
+       "environmentVariables": { "ASPNETCORE_ENVIRONMENT": "Development" }
+     }
+   }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' orig/frontend/src/api/client.ts sol/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-09-30 10:20:56.657924190 +0200
++++ b/frontend/src/api/client.ts	2026-09-30 10:45:44.733700195 +0200
+@@ -1,5 +1,5 @@
+ // Single place for all HTTP calls. Later tutorial steps change auth, base URL and versioning here.
+-export const API_BASE = 'http://localhost:5080'
++export const API_BASE = 'https://localhost:5443'
+ 
+ export interface User {
+   id: number; username: string; displayName: string; email: string; phone: string
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' orig/frontend/src/BlogCard.tsx sol/frontend/src/BlogCard.tsx
+--- a/frontend/src/BlogCard.tsx	2026-09-30 10:20:56.658924187 +0200
++++ b/frontend/src/BlogCard.tsx	2026-09-30 10:45:44.733731133 +0200
+@@ -1,10 +1,10 @@
+-import type { Blog } from './api/client'
++import { API_BASE, type Blog } from './api/client'
+ 
+ export default function BlogCard({ blog, onLike }: { blog: Blog; onLike?: (b: Blog) => void }) {
+   return (
+     <article className="card">
+       <header className="author">
+-        <img src={blog.authorAvatar.startsWith('/') ? `http://localhost:5080${blog.authorAvatar}` : blog.authorAvatar} alt="" width={32} height={32} />
++        <img src={blog.authorAvatar.startsWith('/') ? `${API_BASE}${blog.authorAvatar}` : blog.authorAvatar} alt="" width={32} height={32} />
+         <strong>{blog.authorName}</strong>
+         <small>{new Date(blog.createdAt).toLocaleString()}</small>
+       </header>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' orig/frontend/vite.config.ts sol/frontend/vite.config.ts
+--- a/frontend/vite.config.ts	2026-09-30 10:20:56.656924194 +0200
++++ b/frontend/vite.config.ts	2026-09-30 10:45:44.733741303 +0200
+@@ -1,7 +1,15 @@
++import fs from 'node:fs'
+ import { defineConfig } from 'vite'
+ import react from '@vitejs/plugin-react'
+ 
++// Certificate exported with: dotnet dev-certs https --export-path ../certs/dev.pem --format Pem --no-password
+ export default defineConfig({
+   plugins: [react()],
+-  server: { port: 5173 },
++  server: {
++    port: 5173,
++    https: {
++      cert: fs.readFileSync('../certs/dev.pem'),
++      key: fs.readFileSync('../certs/dev.key'),
++    },
++  },
+ })

@@ -1,0 +1,321 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid06/backend/src/SecLab.Api/Authorization/ApiKeyAuthentication.cs sol06/backend/src/SecLab.Api/Authorization/ApiKeyAuthentication.cs
+--- a/backend/src/SecLab.Api/Authorization/ApiKeyAuthentication.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Authorization/ApiKeyAuthentication.cs	2026-09-30 11:23:08.365162365 +0200
+@@ -0,0 +1,75 @@
++using System.Security.Claims;
++using System.Security.Cryptography;
++using System.Text;
++using System.Text.Encodings.Web;
++using System.Text.RegularExpressions;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Options;
++using SecLab.Api.Data;
++
++namespace SecLab.Api.Authorization;
++
++public static class ApiKeyDefaults
++{
++    public const string Scheme = "ApiKey";
++    public const string Header = "X-Api-Key";
++    public const string LevelClaim = "api_level";
++    public static readonly string[] Levels = ["read", "write", "admin"];          // ordered: each includes the ones before it
++    public static int Rank(string? level) => Array.IndexOf(Levels, level) + 1;     // 0 = unknown
++
++    public static byte[] Hash(string secret) => SHA256.HashData(Encoding.UTF8.GetBytes(secret));
++}
++
++/// <summary>Authenticates machine clients by the X-Api-Key header. Only the hash of the secret is stored.</summary>
++public partial class ApiKeyAuthHandler(IOptionsMonitor<AuthenticationSchemeOptions> options, ILoggerFactory logger, UrlEncoder encoder)
++    : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
++{
++    [GeneratedRegex("^sl_(?<prefix>[A-Za-z0-9]{8})_(?<secret>[A-Za-z0-9]{32,128})$")]
++    private static partial Regex KeyFormat();
++
++    protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
++    {
++        if (!Request.Headers.TryGetValue(ApiKeyDefaults.Header, out var header) || header.Count != 1)
++            return AuthenticateResult.NoResult();
++
++        var m = KeyFormat().Match(header.ToString());
++        if (!m.Success) return AuthenticateResult.Fail("invalid key");
++
++        var db = Context.RequestServices.GetRequiredService<AppDbContext>();
++        var prefix = m.Groups["prefix"].Value;
++        var key = await db.ApiKeys.AsNoTracking().FirstOrDefaultAsync(k => k.Prefix == prefix);
++
++        // Same work whether or not the prefix exists: always compare against *something*.
++        var stored = key?.KeyHash ?? new byte[32];
++        var matches = CryptographicOperations.FixedTimeEquals(ApiKeyDefaults.Hash(m.Groups["secret"].Value), stored);
++        if (key is null || !matches || key.RevokedAt is not null || key.ExpiresAt <= DateTime.UtcNow)
++            return AuthenticateResult.Fail("invalid key");
++
++        if (key.LastUsedAt is null || key.LastUsedAt < DateTime.UtcNow.AddMinutes(-1))
++            await db.ApiKeys.Where(k => k.Id == key.Id).ExecuteUpdateAsync(s => s.SetProperty(k => k.LastUsedAt, DateTime.UtcNow));
++
++        var identity = new ClaimsIdentity(
++        [
++            new Claim(ClaimTypes.NameIdentifier, $"apikey:{key.Id}"),
++            new Claim(LocalUserClaims.LocalUserId, key.OwnerId.ToString()),      // acts on behalf of the key's owner
++            new Claim(ApiKeyDefaults.LevelClaim, key.Level),
++            new Claim("api_key_id", key.Id.ToString()),
++        ], Scheme.Name);
++        return AuthenticateResult.Success(new AuthenticationTicket(new ClaimsPrincipal(identity), Scheme.Name));
++    }
++}
++
++public static class ApiKeyPolicies
++{
++    public static AuthorizationBuilder AddApiKeyPolicies(this AuthorizationBuilder b)
++    {
++        foreach (var level in ApiKeyDefaults.Levels)
++            b.AddPolicy("ApiKey:" + level, p => p
++                .AddAuthenticationSchemes(ApiKeyDefaults.Scheme)                 // this policy authenticates with the key scheme only
++                .RequireAuthenticatedUser()
++                .RequireAssertion(ctx => ApiKeyDefaults.Rank(ctx.User.FindFirst(ApiKeyDefaults.LevelClaim)?.Value) >= ApiKeyDefaults.Rank(level)));
++        return b;
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid06/backend/src/SecLab.Api/Data/AppDbContext.cs sol06/backend/src/SecLab.Api/Data/AppDbContext.cs
+--- a/backend/src/SecLab.Api/Data/AppDbContext.cs	2026-09-30 11:17:50.088483619 +0200
++++ b/backend/src/SecLab.Api/Data/AppDbContext.cs	2026-09-30 11:22:11.086226185 +0200
+@@ -10,11 +10,13 @@
+     public DbSet<Blog> Blogs => Set<Blog>();
+     public DbSet<BlogLike> BlogLikes => Set<BlogLike>();
+     public DbSet<Passkey> Passkeys => Set<Passkey>();
++    public DbSet<ApiKey> ApiKeys => Set<ApiKey>();
+ 
+     protected override void OnModelCreating(ModelBuilder b)
+     {
+         b.Entity<Friendship>().HasKey(f => new { f.UserId, f.FriendId });
+         b.Entity<BlogLike>().HasKey(l => new { l.UserId, l.BlogId });
+         b.Entity<Passkey>().HasIndex(p => p.CredentialId).IsUnique();
++        b.Entity<ApiKey>().HasIndex(k => k.Prefix).IsUnique();
+     }
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid06/backend/src/SecLab.Api/Endpoints/Api.cs sol06/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:17:56.527527646 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:22:11.086337912 +0200
+@@ -92,6 +92,7 @@
+                 : Results.Unauthorized());
+ 
+         Passkeys.Map(api);
++        ApiKeys.Map(api);
+ 
+         // Deleting an account is destructive: it needs a fresh passkey assertion (step-up), not just a valid session.
+         api.MapDelete("/me", async (HttpContext ctx, AppDbContext db, IMemoryCache cache) =>
+@@ -254,7 +255,7 @@
+ 
+     public record BlogView(int Id, int AuthorId, string AuthorName, string AuthorAvatar, string Title, string Body, DateTime CreatedAt, int Likes);
+ 
+-    static async Task<List<BlogView>> ToViews(AppDbContext db, IQueryable<Blog> blogs) =>
++    internal static async Task<List<BlogView>> ToViews(AppDbContext db, IQueryable<Blog> blogs) =>
+         await blogs.Select(b => new BlogView(
+             b.Id, b.AuthorId,
+             db.Users.Where(u => u.Id == b.AuthorId).Select(u => u.DisplayName).FirstOrDefault() ?? "",
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid06/backend/src/SecLab.Api/Endpoints/ApiKeys.cs sol06/backend/src/SecLab.Api/Endpoints/ApiKeys.cs
+--- a/backend/src/SecLab.Api/Endpoints/ApiKeys.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Endpoints/ApiKeys.cs	2026-09-30 11:22:11.071995736 +0200
+@@ -0,0 +1,86 @@
++using System.Security.Claims;
++using System.Security.Cryptography;
++using Microsoft.EntityFrameworkCore;
++using SecLab.Api.Authorization;
++using SecLab.Api.Data;
++using SecLab.Api.Models;
++
++namespace SecLab.Api.Endpoints;
++
++public static class ApiKeys
++{
++    const string Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
++
++    public static void Map(RouteGroupBuilder api)
++    {
++        // ---- key management: signed-in USERS only (default JWT policy); a key can never mint or list keys ----
++        var keys = api.MapGroup("/keys");
++
++        keys.MapPost("/", async (CreateKey req, ClaimsPrincipal me, AppDbContext db) =>
++        {
++            if (me.LocalId() is not { } uid) return Results.Unauthorized();
++            var errors = new Dictionary<string, string[]>();
++            if (string.IsNullOrWhiteSpace(req.Name) || req.Name.Length > 100) errors["name"] = ["1-100 characters"];
++            if (ApiKeyDefaults.Rank(req.Level) == 0) errors["level"] = ["read, write or admin"];
++            if (req.ExpiresInSeconds is <= 0) errors["expiresInSeconds"] = ["must be positive"];
++            if (errors.Count > 0) return Results.ValidationProblem(errors);
++            if (req.Level == "admin" && !me.IsInRole("Admin")) return Results.Forbid();   // you cannot hand out more power than you have
++
++            var prefix = RandomNumberGenerator.GetString(Alphabet, 8);
++            var secret = RandomNumberGenerator.GetString(Alphabet, 40);                    // ~238 bits from a CSPRNG
++            var entity = new ApiKey
++            {
++                OwnerId = uid, Name = req.Name!, Prefix = prefix, KeyHash = ApiKeyDefaults.Hash(secret), Level = req.Level!,
++                ExpiresAt = req.ExpiresInSeconds is { } s ? DateTime.UtcNow.AddSeconds(s) : null,
++            };
++            db.ApiKeys.Add(entity);
++            await db.SaveChangesAsync();
++
++            // The only time the full key exists outside the client's hands.
++            return Results.Created($"/api/keys/{entity.Id}", new { id = entity.Id, apiKey = $"sl_{prefix}_{secret}", entity.Prefix, entity.Level, entity.ExpiresAt });
++        });
++
++        keys.MapGet("/", async (ClaimsPrincipal me, AppDbContext db) =>
++        {
++            if (me.LocalId() is not { } uid) return Results.Unauthorized();
++            return Results.Ok(await db.ApiKeys.Where(k => k.OwnerId == uid).OrderByDescending(k => k.CreatedAt)
++                .Select(k => new { k.Id, k.Name, k.Prefix, k.Level, k.CreatedAt, k.ExpiresAt, k.RevokedAt, k.LastUsedAt }).ToListAsync());
++        });
++
++        keys.MapDelete("/{id:int}", async (int id, ClaimsPrincipal me, AppDbContext db) =>
++        {
++            if (me.LocalId() is not { } uid) return Results.Unauthorized();
++            var key = await db.ApiKeys.FindAsync(id);
++            if (key is null) return Results.NotFound();
++            if (key.OwnerId != uid && !me.IsInRole("Admin")) return Results.Forbid();
++            key.RevokedAt ??= DateTime.UtcNow;
++            await db.SaveChangesAsync();
++            return Results.NoContent();
++        });
++
++        // ---- partner API: API keys only (each policy names the ApiKey scheme) ----
++        var partner = api.MapGroup("/partner");
++
++        partner.MapGet("/blogs", async (AppDbContext db) => Results.Ok(await Api.ToViews(db, db.Blogs.OrderByDescending(b => b.CreatedAt))))
++            .RequireAuthorization("ApiKey:read");
++
++        partner.MapPost("/blogs", async (PartnerBlog req, ClaimsPrincipal caller, AppDbContext db) =>
++        {
++            if (string.IsNullOrWhiteSpace(req.Title) || string.IsNullOrWhiteSpace(req.Body))
++                return Results.ValidationProblem(new Dictionary<string, string[]> { ["title"] = ["title and body are required"] });
++            var blog = new Blog { AuthorId = caller.LocalId()!.Value, Title = req.Title, Body = req.Body };   // author = the key's owner
++            db.Blogs.Add(blog);
++            await db.SaveChangesAsync();
++            return Results.Created($"/api/blogs/{blog.Id}", new { blog.Id });
++        }).RequireAuthorization("ApiKey:write");
++
++        partner.MapDelete("/blogs/{id:int}", async (int id, AppDbContext db) =>
++        {
++            await db.BlogLikes.Where(l => l.BlogId == id).ExecuteDeleteAsync();
++            return await db.Blogs.Where(b => b.Id == id).ExecuteDeleteAsync() == 0 ? Results.NotFound() : Results.NoContent();
++        }).RequireAuthorization("ApiKey:admin");
++    }
++
++    public record CreateKey(string? Name, string? Level, int? ExpiresInSeconds);
++    public record PartnerBlog(string? Title, string? Body);
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid06/backend/src/SecLab.Api/Models/Models.cs sol06/backend/src/SecLab.Api/Models/Models.cs
+--- a/backend/src/SecLab.Api/Models/Models.cs	2026-09-30 11:17:50.088550004 +0200
++++ b/backend/src/SecLab.Api/Models/Models.cs	2026-09-30 11:22:11.086174368 +0200
+@@ -50,3 +50,17 @@
+     public string Name { get; set; } = "Passkey";
+     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+ }
++
++public class ApiKey
++{
++    public int Id { get; set; }
++    public int OwnerId { get; set; }
++    [System.ComponentModel.DataAnnotations.MaxLength(100)] public string Name { get; set; } = "";
++    [System.ComponentModel.DataAnnotations.MaxLength(16)] public string Prefix { get; set; } = "";     // public, used to find the row
++    public byte[] KeyHash { get; set; } = [];                                                          // SHA-256 of the secret; the secret itself is never stored
++    [System.ComponentModel.DataAnnotations.MaxLength(16)] public string Level { get; set; } = "read";
++    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
++    public DateTime? ExpiresAt { get; set; }
++    public DateTime? RevokedAt { get; set; }
++    public DateTime? LastUsedAt { get; set; }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid06/backend/src/SecLab.Api/Program.cs sol06/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 11:17:50.107044717 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 11:22:11.086261420 +0200
+@@ -14,7 +14,9 @@
+ builder.WebHost.ConfigureKestrel(k => k.ConfigureHttpsDefaults(h =>
+     h.SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13));
+ 
+-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(o =>
++builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
++    .AddScheme<AuthenticationSchemeOptions, ApiKeyAuthHandler>(ApiKeyDefaults.Scheme, null)
++    .AddJwtBearer(o =>
+ {
+     o.Authority = builder.Configuration["Auth:Authority"];        // issuer + discovery document + signing keys
+     o.Audience = builder.Configuration["Auth:Audience"];          // this API must be the intended audience
+@@ -24,7 +26,8 @@
+ });
+ builder.Services.AddAuthorizationBuilder()
+     .SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build())   // default deny: an endpoint that forgets [Authorize] is still protected
+-    .AddPolicy("Admin", p => p.RequireRole("Admin"));
++    .AddPolicy("Admin", p => p.RequireRole("Admin"))
++    .AddApiKeyPolicies();
+ builder.Services.AddScoped<IClaimsTransformation, LocalUserClaims>();
+ builder.Services.AddScoped<IAuthorizationHandler, UserResourceHandler>();
+ builder.Services.AddScoped<IAuthorizationHandler, BlogResourceHandler>();
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid06/frontend/src/api/client.ts sol06/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-09-30 11:19:09.424188750 +0200
++++ b/frontend/src/api/client.ts	2026-09-30 11:23:30.727722466 +0200
+@@ -50,6 +50,9 @@
+   assertOptions: () => request<any>('/api/passkeys/assert/options', { method: 'POST', body: '{}' }),
+   assertComplete: (assertion: unknown) => request<{ stepUpToken: string }>('/api/passkeys/assert/complete', { method: 'POST', body: JSON.stringify(assertion) }),
+   deleteAccount: (stepUpToken: string) => request<void>('/api/me', { method: 'DELETE', headers: { 'X-StepUp': stepUpToken } }),
++  apiKeys: () => request<{ id: number; name: string; prefix: string; level: string; createdAt: string; expiresAt: string | null; revokedAt: string | null; lastUsedAt: string | null }[]>('/api/keys'),
++  createApiKey: (name: string, level: string) => request<{ id: number; apiKey: string }>('/api/keys', { method: 'POST', body: JSON.stringify({ name, level }) }),
++  revokeApiKey: (id: number) => request<void>(`/api/keys/${id}`, { method: 'DELETE' }),
+   timeline: () => request<Blog[]>('/api/timeline'),
+   deleteBlog: (blogId: number) => request<void>(`/api/blogs/${blogId}`, { method: 'DELETE' }),
+   like: (blogId: number) => request<void>(`/api/blogs/${blogId}/like`, { method: 'POST' }),
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid06/frontend/src/pages/Profile.tsx sol06/frontend/src/pages/Profile.tsx
+--- a/frontend/src/pages/Profile.tsx	2026-09-30 11:17:50.089145466 +0200
++++ b/frontend/src/pages/Profile.tsx	2026-09-30 11:23:30.727764224 +0200
+@@ -8,12 +8,17 @@
+   const [user, setUser] = useState<User | null>(null)
+   const [friends, setFriends] = useState<User[]>([])
+   const [msg, setMsg] = useState('')
++  const [keys, setKeys] = useState<Awaited<ReturnType<typeof api.apiKeys>>>([])
++  const [newKey, setNewKey] = useState('')
++  const [keyName, setKeyName] = useState('')
++  const [keyLevel, setKeyLevel] = useState('read')
+   const [passkeys, setPasskeys] = useState<{ id: number; name: string; createdAt: string }[]>([])
+ 
+   useEffect(() => {
+     api.user(me.id).then(setUser)
+     api.friends(me.id).then(setFriends)
+     api.passkeys().then(setPasskeys)
++    api.apiKeys().then(setKeys)
+   }, [me.id])
+ 
+   if (!user) return <p>Loading…</p>
+@@ -37,6 +42,11 @@
+     await api.registerComplete(attestation)
+     setPasskeys(await api.passkeys()); setMsg('Passkey added')
+   }
++  const createKey = async () => {
++    const created = await api.createApiKey(keyName || 'my key', keyLevel)
++    setNewKey(created.apiKey); setKeyName(''); setKeys(await api.apiKeys())
++  }
++  const revokeKey = async (id: number) => { await api.revokeApiKey(id); setKeys(await api.apiKeys()) }
+   const deleteAccount = async () => {
+     if (!confirm('Delete your account permanently?')) return
+     const optionsJSON = await api.assertOptions()
+@@ -66,6 +76,23 @@
+         <button onClick={deleteAccount} disabled={passkeys.length === 0} title="Requires a passkey">Delete my account</button>
+       </section>
+       <section className="card">
++        <h2>API keys</h2>
++        {newKey && <p className="error">Copy it now, it is shown only once:<br /><code>{newKey}</code></p>}
++        <input value={keyName} onChange={e => setKeyName(e.target.value)} placeholder="Key name" />
++        <select value={keyLevel} onChange={e => setKeyLevel(e.target.value)}>
++          <option value="read">read</option><option value="write">write</option>{me.role === 'Admin' && <option value="admin">admin</option>}
++        </select>
++        <button onClick={createKey}>Create key</button>
++        <ul className="friends">
++          {keys.map(k => (
++            <li key={k.id}>
++              <div><strong>{k.name}</strong> <small>{k.level} · sl_{k.prefix}_… · last used {k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : 'never'}</small></div>
++              {k.revokedAt ? <small>revoked</small> : <button onClick={() => revokeKey(k.id)}>Revoke</button>}
++            </li>
++          ))}
++        </ul>
++      </section>
++      <section className="card">
+         <h2>Friends ({friends.length})</h2>
+         <ul className="friends">
+           {friends.map(f => (

@@ -1,0 +1,467 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/appsettings.json sol12/backend/src/SecLab.Api/appsettings.json
+--- a/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:56:07.207127645 +0200
++++ b/backend/src/SecLab.Api/appsettings.json	2026-09-30 12:06:05.140325695 +0200
+@@ -29,7 +29,14 @@
+   "Diagnostics": {
+     "DetailedErrors": false
+   },
+-  "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } },
++  "Logging": {
++    "LogLevel": {
++      "Default": "Information",
++      "Microsoft.AspNetCore": "Warning",
++      "Microsoft.EntityFrameworkCore.Database.Command": "Warning",
++      "SecLab.Audit": "Information"
++    }
++  },
+   "AllowedHosts": "localhost;seclab.example",
+   "Cors": {
+     "AllowedOrigins": [ "https://localhost:5173" ]
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/Authorization/ApiKeyAuthentication.cs sol12/backend/src/SecLab.Api/Authorization/ApiKeyAuthentication.cs
+--- a/backend/src/SecLab.Api/Authorization/ApiKeyAuthentication.cs	2026-09-30 11:56:07.198009530 +0200
++++ b/backend/src/SecLab.Api/Authorization/ApiKeyAuthentication.cs	2026-09-30 12:06:05.140500464 +0200
+@@ -8,6 +8,7 @@
+ using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Options;
+ using SecLab.Api.Data;
++using SecLab.Api.Observability;
+ 
+ namespace SecLab.Api.Authorization;
+ 
+@@ -34,8 +35,9 @@
+         if (!Request.Headers.TryGetValue(ApiKeyDefaults.Header, out var header) || header.Count != 1)
+             return AuthenticateResult.NoResult();
+ 
++        var audit = Context.RequestServices.GetRequiredService<AuditLog>();
+         var m = KeyFormat().Match(header.ToString());
+-        if (!m.Success) return AuthenticateResult.Fail("invalid key");
++        if (!m.Success) { audit.ApiKeyRejected(Context, "malformed"); return AuthenticateResult.Fail("invalid key"); }
+ 
+         var db = Context.RequestServices.GetRequiredService<AppDbContext>();
+         var prefix = m.Groups["prefix"].Value;
+@@ -45,7 +47,10 @@
+         var stored = key?.KeyHash ?? new byte[32];
+         var matches = CryptographicOperations.FixedTimeEquals(ApiKeyDefaults.Hash(m.Groups["secret"].Value), stored);
+         if (key is null || !matches || key.RevokedAt is not null || key.ExpiresAt <= DateTime.UtcNow)
++        {
++            audit.ApiKeyRejected(Context, key is null ? "unknown" : !matches ? "bad_secret" : key.RevokedAt is not null ? "revoked" : "expired");
+             return AuthenticateResult.Fail("invalid key");
++        }
+ 
+         if (key.LastUsedAt is null || key.LastUsedAt < DateTime.UtcNow.AddMinutes(-1))
+             await db.ApiKeys.Where(k => k.Id == key.Id).ExecuteUpdateAsync(s => s.SetProperty(k => k.LastUsedAt, DateTime.UtcNow));
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/Endpoints/Api.cs sol12/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 12:00:31.740799941 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 12:06:05.140439750 +0200
+@@ -11,6 +11,7 @@
+ using Microsoft.AspNetCore.RateLimiting;
+ using SecLab.Api.Data;
+ using SecLab.Api.Errors;
++using SecLab.Api.Observability;
+ using SecLab.Api.Models;
+ using SecLab.Api.Validation;
+ using System.ComponentModel.DataAnnotations;
+@@ -36,7 +37,7 @@
+         var auth = api.MapGroup("/auth").AllowAnonymous().RequireRateLimiting(RateLimiting.RateLimiting.LoginPolicy);            // legacy local login/registration stay public for now
+ 
+         // ---- Auth ----
+-        auth.MapPost("/register", async (RegisterRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
++        auth.MapPost("/register", async (RegisterRequest req, HttpContext ctx, AppDbContext db, IPasswordHasher<User> hasher, AuditLog audit) =>
+         {
+             if (await db.Users.AnyAsync(u => u.Username == req.Username)) return Problems.Create(StatusCodes.Status409Conflict, "That username is not available.");
+ 
+@@ -44,10 +45,11 @@
+             user.Password = hasher.HashPassword(user, req.Password!);
+             db.Users.Add(user);
+             await db.SaveChangesAsync();
++            audit.UserRegistered(ctx, user.Id);
+             return Results.Created($"/api/users/{user.Id}", new { user.Id, user.Username });
+         });
+ 
+-        auth.MapPost("/login", async (LoginRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
++        auth.MapPost("/login", async (LoginRequest req, HttpContext ctx, AppDbContext db, IPasswordHasher<User> hasher, AuditLog audit) =>
+         {
+             // One answer for every failure: unknown user, wrong password and locked account look identical.
+             IResult Fail() => Problems.Create(StatusCodes.Status401Unauthorized, "Authentication failed.");
+@@ -56,9 +58,10 @@
+             if (user is null)
+             {
+                 hasher.HashPassword(new User(), req.Password ?? "");   // burn the same CPU time as a real check
++                audit.LoginFailed(ctx, req.Username, "unknown_user");
+                 return Fail();
+             }
+-            if (user.LockoutEnd > DateTime.UtcNow) return Fail();
++            if (user.LockoutEnd > DateTime.UtcNow) { audit.LoginFailed(ctx, req.Username, "locked"); return Fail(); }
+ 
+             var supplied = req.Password ?? "";
+             var ok = user.PasswordIsHashed
+@@ -67,8 +70,11 @@
+ 
+             if (!ok)
+             {
+-                if (++user.FailedLoginCount >= 5) { user.LockoutEnd = DateTime.UtcNow.AddMinutes(5); user.FailedLoginCount = 0; }
++                var lockedNow = ++user.FailedLoginCount >= 5;
++                if (lockedNow) { user.LockoutEnd = DateTime.UtcNow.AddMinutes(5); user.FailedLoginCount = 0; }
+                 await db.SaveChangesAsync();
++                audit.LoginFailed(ctx, req.Username, "bad_password");
++                if (lockedNow) audit.LoginLocked(ctx, user.Id);
+                 return Fail();
+             }
+ 
+@@ -81,6 +87,7 @@
+             }
+             user.FailedLoginCount = 0; user.LockoutEnd = null;
+             await db.SaveChangesAsync();
++            audit.LoginSucceeded(ctx, user.Id);
+ 
+             // WEAKNESS (until step 03): the "token" is still just the user id. Never return the password column.
+             return Results.Ok(new { token = user.Id.ToString(), user = new { user.Id, user.Username, user.DisplayName, user.Email, user.Phone, user.Address, user.AvatarUrl, user.Bio, user.Role } });
+@@ -97,7 +104,7 @@
+         ApiKeys.Map(api);
+ 
+         // Deleting an account is destructive: it needs a fresh passkey assertion (step-up), not just a valid session.
+-        api.MapDelete("/me", async (HttpContext ctx, AppDbContext db, IMemoryCache cache) =>
++        api.MapDelete("/me", async (HttpContext ctx, AppDbContext db, IMemoryCache cache, AuditLog audit) =>
+         {
+             if (await CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
+             var username = ctx.User.FindFirst("preferred_username")!.Value;
+@@ -108,6 +115,7 @@
+             await db.Passkeys.Where(p => p.UserId == uid).ExecuteDeleteAsync();
+             await db.Blogs.Where(b => b.AuthorId == uid).ExecuteDeleteAsync();
+             await db.Users.Where(u => u.Id == uid).ExecuteDeleteAsync();
++            audit.AccountDeleted(ctx, uid);
+             return Results.NoContent();
+         });
+ 
+@@ -179,10 +187,11 @@
+         var admin = api.MapGroup("/admin").RequireAuthorization("Admin");
+         admin.MapGet("/users", async (AppDbContext db) =>
+             await db.Users.Select(u => new { u.Id, u.Username, u.DisplayName, u.Email, u.Role }).ToListAsync());
+-        admin.MapPut("/users/{id:int}/role", async (int id, ChangeRole req, AppDbContext db) =>
++        admin.MapPut("/users/{id:int}/role", async (int id, ChangeRole req, HttpContext ctx, ClaimsPrincipal me, AppDbContext db, AuditLog audit) =>
+         {
+             if (req.Role is not ("User" or "Admin")) return Results.ValidationProblem(new Dictionary<string, string[]> { ["role"] = ["must be User or Admin"] });
+             var updated = await db.Users.Where(u => u.Id == id).ExecuteUpdateAsync(s => s.SetProperty(u => u.Role, req.Role));
++            if (updated > 0) audit.RoleChanged(ctx, me.LocalId() ?? 0, id, req.Role!);
+             return updated == 0 ? Results.NotFound() : Results.NoContent();
+         });
+ 
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/Endpoints/ApiKeys.cs sol12/backend/src/SecLab.Api/Endpoints/ApiKeys.cs
+--- a/backend/src/SecLab.Api/Endpoints/ApiKeys.cs	2026-09-30 11:56:07.198058652 +0200
++++ b/backend/src/SecLab.Api/Endpoints/ApiKeys.cs	2026-09-30 12:06:05.140472522 +0200
+@@ -4,6 +4,7 @@
+ using SecLab.Api.Authorization;
+ using SecLab.Api.Data;
+ using SecLab.Api.Models;
++using SecLab.Api.Observability;
+ using SecLab.Api.Validation;
+ 
+ namespace SecLab.Api.Endpoints;
+@@ -17,7 +18,7 @@
+         // ---- key management: signed-in USERS only (default JWT policy); a key can never mint or list keys ----
+         var keys = api.MapGroup("/keys");
+ 
+-        keys.MapPost("/", async (CreateKey req, ClaimsPrincipal me, AppDbContext db) =>
++        keys.MapPost("/", async (CreateKey req, HttpContext ctx, ClaimsPrincipal me, AppDbContext db, AuditLog audit) =>
+         {
+             if (me.LocalId() is not { } uid) return Results.Unauthorized();
+             var errors = new Dictionary<string, string[]>();
+@@ -36,6 +37,7 @@
+             };
+             db.ApiKeys.Add(entity);
+             await db.SaveChangesAsync();
++            audit.ApiKeyCreated(ctx, uid, entity.Id, entity.Level);
+ 
+             // The only time the full key exists outside the client's hands.
+             return Results.Created($"/api/keys/{entity.Id}", new { id = entity.Id, apiKey = $"sl_{prefix}_{secret}", entity.Prefix, entity.Level, entity.ExpiresAt });
+@@ -48,7 +50,7 @@
+                 .Select(k => new { k.Id, k.Name, k.Prefix, k.Level, k.CreatedAt, k.ExpiresAt, k.RevokedAt, k.LastUsedAt }).ToListAsync());
+         });
+ 
+-        keys.MapDelete("/{id:int}", async (int id, ClaimsPrincipal me, AppDbContext db) =>
++        keys.MapDelete("/{id:int}", async (int id, HttpContext ctx, ClaimsPrincipal me, AppDbContext db, AuditLog audit) =>
+         {
+             if (me.LocalId() is not { } uid) return Results.Unauthorized();
+             var key = await db.ApiKeys.FindAsync(id);
+@@ -56,6 +58,7 @@
+             if (key.OwnerId != uid && !me.IsInRole("Admin")) return Results.Forbid();
+             key.RevokedAt ??= DateTime.UtcNow;
+             await db.SaveChangesAsync();
++            audit.ApiKeyRevoked(ctx, uid, id);
+             return Results.NoContent();
+         });
+ 
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/Endpoints/Passkeys.cs sol12/backend/src/SecLab.Api/Endpoints/Passkeys.cs
+--- a/backend/src/SecLab.Api/Endpoints/Passkeys.cs	2026-09-30 11:56:07.198065745 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Passkeys.cs	2026-09-30 12:06:05.140542233 +0200
+@@ -5,6 +5,7 @@
+ using Microsoft.Extensions.Caching.Memory;
+ using SecLab.Api.Data;
+ using SecLab.Api.Models;
++using SecLab.Api.Observability;
+ 
+ namespace SecLab.Api.Endpoints;
+ 
+@@ -38,7 +39,7 @@
+             return Results.Content(options.ToJson(), "application/json");
+         });
+ 
+-        g.MapPost("/register/complete", async (AuthenticatorAttestationRawResponse response, HttpContext ctx, AppDbContext db, IFido2 fido2, IMemoryCache cache) =>
++        g.MapPost("/register/complete", async (AuthenticatorAttestationRawResponse response, HttpContext ctx, AppDbContext db, IFido2 fido2, IMemoryCache cache, AuditLog audit) =>
+         {
+             if (await Api.CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
+             // Single use: take the challenge out of the cache *before* verifying anything.
+@@ -56,10 +57,12 @@
+                 });
+                 db.Passkeys.Add(new Passkey { UserId = uid, CredentialId = cred.Id, PublicKey = cred.PublicKey, SignCount = cred.SignCount, UserHandle = options.User.Id });
+                 await db.SaveChangesAsync();
++                audit.PasskeyRegistered(ctx, uid);
+                 return Results.Ok(new { id = Convert.ToBase64String(cred.Id) });
+             }
+             catch (Fido2VerificationException)
+             {
++                audit.PasskeyFailed(ctx, uid, "registration");
+                 return Results.BadRequest(new { error = "Passkey registration failed" });
+             }
+         }).DisableValidation();   // the body is an external library type; the Fido2 library verifies it (DataAnnotations would not apply)
+@@ -75,7 +78,7 @@
+             return Results.Content(options.ToJson(), "application/json");
+         });
+ 
+-        g.MapPost("/assert/complete", async (AuthenticatorAssertionRawResponse response, HttpContext ctx, AppDbContext db, IFido2 fido2, IMemoryCache cache) =>
++        g.MapPost("/assert/complete", async (AuthenticatorAssertionRawResponse response, HttpContext ctx, AppDbContext db, IFido2 fido2, IMemoryCache cache, AuditLog audit) =>
+         {
+             if (await Api.CurrentUserId(ctx, db) is not { } uid) return Results.Unauthorized();
+             if (!cache.TryGetValue(Key("assert", uid), out string? json)) return Results.BadRequest(new { error = "No assertion in progress" });
+@@ -101,11 +104,13 @@
+             }
+             catch (Fido2VerificationException)
+             {
++                audit.PasskeyFailed(ctx, uid, "assertion");
+                 return Results.BadRequest(new { error = "Passkey assertion failed" });
+             }
+ 
+             var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+             cache.Set($"stepup:{token}", ctx.User.FindFirst("preferred_username")!.Value, CeremonyLifetime);
++            audit.StepUpGranted(ctx, uid);
+             return Results.Ok(new { stepUpToken = token, expiresIn = (int)CeremonyLifetime.TotalSeconds });
+         }).DisableValidation();   // the body is an external library type; the Fido2 library verifies it (DataAnnotations would not apply)
+ 
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/Errors/GlobalExceptionHandler.cs sol12/backend/src/SecLab.Api/Errors/GlobalExceptionHandler.cs
+--- a/backend/src/SecLab.Api/Errors/GlobalExceptionHandler.cs	2026-09-30 11:56:07.199478787 +0200
++++ b/backend/src/SecLab.Api/Errors/GlobalExceptionHandler.cs	2026-09-30 12:06:05.140350091 +0200
+@@ -9,7 +9,7 @@
+ /// The only place where exceptions turn into responses. Callers get a generic problem-details body and a trace id;
+ /// the exception itself (message, stack, inner SQL errors) goes to the log where the trace id lets you find it.
+ /// </summary>
+-public class GlobalExceptionHandler(IProblemDetailsService problems, ILogger<GlobalExceptionHandler> logger, IConfiguration config) : IExceptionHandler
++public class GlobalExceptionHandler(IProblemDetailsService problems, ILogger<GlobalExceptionHandler> logger, IConfiguration config, SecLab.Api.Observability.SecurityMetrics metrics) : IExceptionHandler
+ {
+     public async ValueTask<bool> TryHandleAsync(HttpContext ctx, Exception exception, CancellationToken ct)
+     {
+@@ -23,6 +23,7 @@
+         };
+ 
+         var traceId = Activity.Current?.Id ?? ctx.TraceIdentifier;
++        if (status >= 500) metrics.UnhandledErrors.Add(1);
+         if (status >= 500) logger.LogError(exception, "Unhandled exception. TraceId={TraceId} Path={Path}", traceId, ctx.Request.Path.Value);
+         else logger.LogWarning("Request failed with {Status}: {Message}. TraceId={TraceId}", status, exception.Message, traceId);
+ 
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/Observability/Audit.cs sol12/backend/src/SecLab.Api/Observability/Audit.cs
+--- a/backend/src/SecLab.Api/Observability/Audit.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Observability/Audit.cs	2026-09-30 12:06:35.181235720 +0200
+@@ -0,0 +1,121 @@
++using System.Diagnostics.Metrics;
++using System.Text;
++
++namespace SecLab.Api.Observability;
++
++/// <summary>
++/// Security events go to one dedicated category ("SecLab.Audit") with a fixed vocabulary of structured properties,
++/// so they can be routed, retained and alerted on separately from application noise.
++/// RULES: never log credentials or personal data beyond what an investigation needs; sanitise everything a user typed.
++/// </summary>
++public sealed class AuditLog(ILoggerFactory loggers, SecurityMetrics metrics)
++{
++    readonly ILogger _log = loggers.CreateLogger("SecLab.Audit");
++    public SecurityMetrics Metrics { get; } = metrics;
++
++    public static string Ip(HttpContext ctx)
++    {
++        var ip = ctx.Connection.RemoteIpAddress;
++        return ip is null ? "unknown" : (ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip).ToString();
++    }
++
++    /// <summary>User-controlled text: no control characters (log forging, terminal escapes), bounded length.</summary>
++    public static string Clean(string? value, int max = 64)
++    {
++        if (string.IsNullOrEmpty(value)) return "";
++        var sb = new StringBuilder(Math.Min(value.Length, max));
++        foreach (var c in value)
++        {
++            if (sb.Length >= max) break;
++            if (!char.IsControl(c)) sb.Append(c);
++        }
++        return sb.ToString();
++    }
++
++    // ---- authentication ----
++    public void LoginFailed(HttpContext ctx, string? username, string reason)
++    {
++        Metrics.LoginFailures.Add(1, new KeyValuePair<string, object?>("reason", reason));
++        _log.LogWarning("Audit {Event}: user {Username} from {ClientIp}, reason {Reason}", "login.failed", Clean(username), Ip(ctx), reason);
++    }
++    public void LoginSucceeded(HttpContext ctx, int userId) =>
++        _log.LogInformation("Audit {Event}: user {UserId} from {ClientIp}", "login.succeeded", userId, Ip(ctx));
++    public void LoginLocked(HttpContext ctx, int userId)
++    {
++        Metrics.Lockouts.Add(1);
++        _log.LogWarning("Audit {Event}: user {UserId} from {ClientIp}", "login.locked", userId, Ip(ctx));
++    }
++    public void UserRegistered(HttpContext ctx, int userId) =>
++        _log.LogInformation("Audit {Event}: user {UserId} from {ClientIp}", "user.registered", userId, Ip(ctx));
++
++    // ---- keys and second factors ----
++    public void ApiKeyCreated(HttpContext ctx, int userId, int keyId, string level) =>
++        _log.LogInformation("Audit {Event}: user {UserId} key {KeyId} level {Level} from {ClientIp}", "apikey.created", userId, keyId, level, Ip(ctx));
++    public void ApiKeyRevoked(HttpContext ctx, int userId, int keyId) =>
++        _log.LogInformation("Audit {Event}: user {UserId} key {KeyId} from {ClientIp}", "apikey.revoked", userId, keyId, Ip(ctx));
++    public void ApiKeyRejected(HttpContext ctx, string reason)
++    {
++        Metrics.ApiKeyRejected.Add(1, new KeyValuePair<string, object?>("reason", reason));
++        _log.LogWarning("Audit {Event}: from {ClientIp}, reason {Reason}", "apikey.rejected", Ip(ctx), reason);
++    }
++    public void PasskeyRegistered(HttpContext ctx, int userId) =>
++        _log.LogInformation("Audit {Event}: user {UserId} from {ClientIp}", "passkey.registered", userId, Ip(ctx));
++    public void PasskeyFailed(HttpContext ctx, int userId, string stage) =>
++        _log.LogWarning("Audit {Event}: user {UserId} stage {Stage} from {ClientIp}", "passkey.failed", userId, stage, Ip(ctx));
++    public void StepUpGranted(HttpContext ctx, int userId) =>
++        _log.LogInformation("Audit {Event}: user {UserId} from {ClientIp}", "stepup.granted", userId, Ip(ctx));
++
++    // ---- privileged and destructive actions ----
++    public void RoleChanged(HttpContext ctx, int actorId, int targetId, string newRole) =>
++        _log.LogWarning("Audit {Event}: actor {UserId} changed user {TargetUserId} to {NewRole} from {ClientIp}", "role.changed", actorId, targetId, newRole, Ip(ctx));
++    public void AccountDeleted(HttpContext ctx, int userId) =>
++        _log.LogWarning("Audit {Event}: user {UserId} from {ClientIp}", "account.deleted", userId, Ip(ctx));
++
++    // ---- what the pipeline denied (see AuditMiddleware) ----
++    public void Denied(HttpContext ctx, string eventName, int? userId, string endpoint)
++    {
++        if (eventName == "authz.denied") Metrics.AuthzDenied.Add(1);
++        if (eventName == "ratelimit.rejected") Metrics.RateLimited.Add(1);
++        var level = eventName == "authn.required" ? LogLevel.Information : LogLevel.Warning;
++        _log.Log(level, "Audit {Event}: user {UserId} endpoint {Endpoint} from {ClientIp}", eventName, userId?.ToString() ?? "anonymous", Clean(endpoint, 120), Ip(ctx));
++    }
++}
++
++/// <summary>Counters for alerting. Tags are few and low-cardinality; NEVER add user names, IPs, emails or paths as tags.</summary>
++public sealed class SecurityMetrics
++{
++    public const string MeterName = "SecLab.Security";
++    public Counter<long> LoginFailures { get; }
++    public Counter<long> Lockouts { get; }
++    public Counter<long> AuthzDenied { get; }
++    public Counter<long> RateLimited { get; }
++    public Counter<long> ApiKeyRejected { get; }
++    public Counter<long> UnhandledErrors { get; }
++
++    public SecurityMetrics(IMeterFactory factory)
++    {
++        var m = factory.Create(MeterName);
++        LoginFailures = m.CreateCounter<long>("seclab.auth.login.failures", description: "Failed logins, by internal reason");
++        Lockouts = m.CreateCounter<long>("seclab.auth.lockouts", description: "Accounts locked after repeated failures");
++        AuthzDenied = m.CreateCounter<long>("seclab.authz.denied", description: "Requests answered 403");
++        RateLimited = m.CreateCounter<long>("seclab.ratelimit.rejected", description: "Requests answered 429");
++        ApiKeyRejected = m.CreateCounter<long>("seclab.apikey.rejected", description: "Invalid, revoked or expired API keys presented");
++        UnhandledErrors = m.CreateCounter<long>("seclab.errors.unhandled", description: "Unhandled exceptions (HTTP 5xx)");
++    }
++}
++
++/// <summary>Records what the pipeline refused - 401, 403 and 429 - whichever component refused it.</summary>
++public static class AuditMiddleware
++{
++    public static IApplicationBuilder UseSecurityAudit(this IApplicationBuilder app) =>
++        app.Use(async (ctx, next) =>
++        {
++            await next();
++            var status = ctx.Response.StatusCode;
++            if (status is not (401 or 403 or 429)) return;
++            var audit = ctx.RequestServices.GetRequiredService<AuditLog>();
++            var eventName = status switch { 403 => "authz.denied", 429 => "ratelimit.rejected", _ => "authn.required" };
++            var userId = int.TryParse(ctx.User.FindFirst("local_user_id")?.Value, out var id) ? id : (int?)null;
++            audit.Denied(ctx, eventName, userId, ctx.GetEndpoint()?.DisplayName ?? ctx.Request.Path.Value ?? "");
++        });
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/Program.cs sol12/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 11:57:42.871712475 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 12:06:13.927889668 +0200
+@@ -5,7 +5,13 @@
+ using Microsoft.AspNetCore.Authentication.JwtBearer;
+ using Microsoft.AspNetCore.Authorization;
+ using SecLab.Api.Authorization;
++using OpenTelemetry;
++using OpenTelemetry.Logs;
++using OpenTelemetry.Metrics;
++using OpenTelemetry.Resources;
++using OpenTelemetry.Trace;
+ using SecLab.Api.Errors;
++using SecLab.Api.Observability;
+ using SecLab.Api.RateLimiting;
+ using SecLab.Api.Security;
+ using SecLab.Api.Validation;
+@@ -40,6 +46,20 @@
+ builder.Services.AddScoped<IClaimsTransformation, LocalUserClaims>();
+ builder.Services.AddScoped<IAuthorizationHandler, UserResourceHandler>();
+ builder.Services.AddScoped<IAuthorizationHandler, BlogResourceHandler>();
++// ---- observability ----
++// Logs: one JSON object per line (machines parse them; humans use the dashboard), scopes included so TraceId travels with every entry.
++builder.Logging.ClearProviders();
++builder.Logging.AddJsonConsole(o => { o.IncludeScopes = true; o.UseUtcTimestamp = true; o.TimestampFormat = "o"; });
++builder.Services.AddSingleton<SecurityMetrics>();
++builder.Services.AddSingleton<AuditLog>();
++builder.Services.AddHealthChecks().AddDbContextCheck<AppDbContext>("database", tags: ["ready"]);
++var telemetry = builder.Services.AddOpenTelemetry()
++    .ConfigureResource(r => r.AddService("seclab-api"))
++    .WithTracing(t => t.AddAspNetCoreInstrumentation().AddHttpClientInstrumentation())
++    .WithMetrics(m => m.AddAspNetCoreInstrumentation().AddHttpClientInstrumentation().AddRuntimeInstrumentation().AddMeter(SecurityMetrics.MeterName));
++builder.Logging.AddOpenTelemetry(o => { o.IncludeScopes = true; o.IncludeFormattedMessage = true; o.ParseStateValues = true; });
++if (!string.IsNullOrEmpty(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"])) telemetry.UseOtlpExporter();   // only when a collector is configured
++
+ var v1Sunset = DateTimeOffset.Parse(builder.Configuration["Api:V1SunsetDate"] ?? "2027-06-30", System.Globalization.CultureInfo.InvariantCulture,
+     System.Globalization.DateTimeStyles.AssumeUniversal);
+ builder.Services.AddSingleton<Microsoft.AspNetCore.Http.IProblemDetailsWriter, AlwaysJsonProblemWriter>();   // before AddProblemDetails: tried first
+@@ -98,6 +118,7 @@
+ // No developer exception page: it prints source, stack and configuration to whoever triggers an error.
+ app.UseExceptionHandler();                    // -> GlobalExceptionHandler -> problem+json
+ app.UseStatusCodePages();                     // 401/403/404/405/415 ... without a body get a problem+json body too
++app.UseSecurityAudit();                       // records every 401/403/429, whoever produced it
+ if (!app.Environment.IsDevelopment()) app.UseHsts();   // browsers remember: HTTPS only (skipped on localhost by design)
+ app.UseHttpsRedirection();
+ app.Use((ctx, next) =>
+@@ -142,6 +163,10 @@
+ using (var scope = app.Services.CreateScope())
+     Seed.Run(scope.ServiceProvider.GetRequiredService<AppDbContext>(), scope.ServiceProvider.GetRequiredService<IPasswordHasher<User>>());
+ 
++// Probes: anonymous, exempt from rate limits, and they say nothing but the status.
++app.MapHealthChecks("/health/live", new() { Predicate = _ => false }).AllowAnonymous().DisableRateLimiting();
++app.MapHealthChecks("/health/ready", new() { Predicate = c => c.Tags.Contains("ready") }).AllowAnonymous().DisableRateLimiting();
++
+ Api.Map(app);
+ app.Run();
+ 
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid12/backend/src/SecLab.Api/SecLab.Api.csproj sol12/backend/src/SecLab.Api/SecLab.Api.csproj
+--- a/backend/src/SecLab.Api/SecLab.Api.csproj	2026-09-30 11:56:07.198163339 +0200
++++ b/backend/src/SecLab.Api/SecLab.Api.csproj	2026-09-30 12:06:05.140114308 +0200
+@@ -9,6 +9,12 @@
+     <PackageReference Include="Asp.Versioning.Http" Version="10.2.3" />
+     <PackageReference Include="Fido2.AspNet" Version="4.1.1" />
+     <PackageReference Include="HtmlSanitizer" Version="9.2.1039" />
++    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.EntityFrameworkCore" Version="10.0.12" />
++    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.19.1" />
++    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.19.1" />
++    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.19.0" />
++    <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.19.0" />
++    <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" Version="1.19.0" />
+     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.0" />
+     <PackageReference Include="Microsoft.Extensions.Identity.Core" Version="10.0.0" />
+   </ItemGroup>

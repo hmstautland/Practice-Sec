@@ -1,0 +1,1928 @@
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/src/SecLab.Api/Data/AppDbContext.cs sol16/backend/src/SecLab.Api/Data/AppDbContext.cs
+--- a/backend/src/SecLab.Api/Data/AppDbContext.cs	2026-10-04 21:32:20.561163443 +0200
++++ b/backend/src/SecLab.Api/Data/AppDbContext.cs	2026-10-04 21:36:54.726823018 +0200
+@@ -17,6 +17,8 @@
+     {
+         b.Entity<Friendship>().HasKey(f => new { f.UserId, f.FriendId });
+         b.Entity<BlogLike>().HasKey(l => new { l.UserId, l.BlogId });
++        b.Entity<User>().Property(u => u.Username).HasMaxLength(32);        // the registration contract (Validation/Contracts.cs); an indexed column needs a bounded type
++        b.Entity<User>().HasIndex(u => u.Username).IsUnique();               // "check, then insert" is not enough: two requests can pass the check together
+         b.Entity<Passkey>().HasIndex(p => p.CredentialId).IsUnique();
+         b.Entity<ApiKey>().HasIndex(k => k.Prefix).IsUnique();
+ 
+@@ -27,3 +29,9 @@
+         b.Entity<User>().Property(u => u.Address).HasConversion(encrypted);
+     }
+ }
++
++public static class SqlErrors
++{
++    /// <summary>SQL Server error 2601 (duplicate key in a unique index) or 2627 (primary key / unique constraint violation).</summary>
++    public static bool IsUniqueViolation(DbUpdateException e) => e.InnerException is Microsoft.Data.SqlClient.SqlException { Number: 2601 or 2627 };
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/src/SecLab.Api/Endpoints/Api.cs sol16/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-10-04 21:32:20.561264433 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-10-04 21:38:32.762298234 +0200
+@@ -44,7 +44,11 @@
+             var user = new User { Username = req.Username!, DisplayName = req.DisplayName ?? req.Username!, Email = req.Email!, PasswordIsHashed = true };
+             user.Password = hasher.HashPassword(user, req.Password!);
+             db.Users.Add(user);
+-            await db.SaveChangesAsync();
++            try { await db.SaveChangesAsync(); }
++            catch (DbUpdateException e) when (SqlErrors.IsUniqueViolation(e))          // two requests passed the check above at the same moment: the unique index decides
++            {
++                return Problems.Create(StatusCodes.Status409Conflict, "That username is not available.");
++            }
+             audit.UserRegistered(ctx, user.Id);
+             return Results.Created($"/api/users/{user.Id}", new { user.Id, user.Username });
+         });
+@@ -258,7 +262,8 @@
+             if (!await db.BlogLikes.AnyAsync(l => l.UserId == uid && l.BlogId == id))
+             {
+                 db.BlogLikes.Add(new BlogLike { UserId = uid, BlogId = id });
+-                await db.SaveChangesAsync();
++                try { await db.SaveChangesAsync(); }
++                catch (DbUpdateException e) when (SqlErrors.IsUniqueViolation(e)) { }   // the same like arrived twice at once: it is there, which is what was asked for
+             }
+             return Results.NoContent();
+         });
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/src/SecLab.Api/Migrations/20261004192109_UniqueUsername.cs sol16/backend/src/SecLab.Api/Migrations/20261004192109_UniqueUsername.cs
+--- a/backend/src/SecLab.Api/Migrations/20261004192109_UniqueUsername.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Migrations/20261004192109_UniqueUsername.cs	2026-10-04 21:33:24.027457765 +0200
+@@ -0,0 +1,46 @@
++﻿using Microsoft.EntityFrameworkCore.Migrations;
++
++#nullable disable
++
++namespace SecLab.Api.Migrations
++{
++    /// <inheritdoc />
++    public partial class UniqueUsername : Migration
++    {
++        /// <inheritdoc />
++        protected override void Up(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.AlterColumn<string>(
++                name: "Username",
++                table: "Users",
++                type: "nvarchar(32)",
++                maxLength: 32,
++                nullable: false,
++                oldClrType: typeof(string),
++                oldType: "nvarchar(max)");
++
++            migrationBuilder.CreateIndex(
++                name: "IX_Users_Username",
++                table: "Users",
++                column: "Username",
++                unique: true);
++        }
++
++        /// <inheritdoc />
++        protected override void Down(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.DropIndex(
++                name: "IX_Users_Username",
++                table: "Users");
++
++            migrationBuilder.AlterColumn<string>(
++                name: "Username",
++                table: "Users",
++                type: "nvarchar(max)",
++                nullable: false,
++                oldClrType: typeof(string),
++                oldType: "nvarchar(32)",
++                oldMaxLength: 32);
++        }
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/src/SecLab.Api/Migrations/20261004192109_UniqueUsername.Designer.cs sol16/backend/src/SecLab.Api/Migrations/20261004192109_UniqueUsername.Designer.cs
+--- a/backend/src/SecLab.Api/Migrations/20261004192109_UniqueUsername.Designer.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Migrations/20261004192109_UniqueUsername.Designer.cs	2026-10-04 21:33:24.027466261 +0200
+@@ -0,0 +1,237 @@
++﻿// <auto-generated />
++using System;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Infrastructure;
++using Microsoft.EntityFrameworkCore.Metadata;
++using Microsoft.EntityFrameworkCore.Migrations;
++using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
++using SecLab.Api.Data;
++
++#nullable disable
++
++namespace SecLab.Api.Migrations
++{
++    [DbContext(typeof(AppDbContext))]
++    [Migration("20261004192109_UniqueUsername")]
++    partial class UniqueUsername
++    {
++        /// <inheritdoc />
++        protected override void BuildTargetModel(ModelBuilder modelBuilder)
++        {
++#pragma warning disable 612, 618
++            modelBuilder
++                .HasAnnotation("ProductVersion", "10.0.12")
++                .HasAnnotation("Relational:MaxIdentifierLength", 128);
++
++            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
++
++            modelBuilder.Entity("SecLab.Api.Models.ApiKey", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<DateTime?>("ExpiresAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<byte[]>("KeyHash")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<DateTime?>("LastUsedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Level")
++                        .IsRequired()
++                        .HasMaxLength(16)
++                        .HasColumnType("nvarchar(16)");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasMaxLength(100)
++                        .HasColumnType("nvarchar(100)");
++
++                    b.Property<int>("OwnerId")
++                        .HasColumnType("int");
++
++                    b.Property<string>("Prefix")
++                        .IsRequired()
++                        .HasMaxLength(16)
++                        .HasColumnType("nvarchar(16)");
++
++                    b.Property<DateTime?>("RevokedAt")
++                        .HasColumnType("datetime2");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("Prefix")
++                        .IsUnique();
++
++                    b.ToTable("ApiKeys");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Blog", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<int>("AuthorId")
++                        .HasColumnType("int");
++
++                    b.Property<string>("Body")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Title")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.HasKey("Id");
++
++                    b.ToTable("Blogs");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.BlogLike", b =>
++                {
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.Property<int>("BlogId")
++                        .HasColumnType("int");
++
++                    b.HasKey("UserId", "BlogId");
++
++                    b.ToTable("BlogLikes");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Friendship", b =>
++                {
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.Property<int>("FriendId")
++                        .HasColumnType("int");
++
++                    b.HasKey("UserId", "FriendId");
++
++                    b.ToTable("Friendships");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.Passkey", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<DateTime>("CreatedAt")
++                        .HasColumnType("datetime2");
++
++                    b.Property<byte[]>("CredentialId")
++                        .IsRequired()
++                        .HasMaxLength(512)
++                        .HasColumnType("varbinary(512)");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<byte[]>("PublicKey")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<long>("SignCount")
++                        .HasColumnType("bigint");
++
++                    b.Property<byte[]>("UserHandle")
++                        .IsRequired()
++                        .HasColumnType("varbinary(max)");
++
++                    b.Property<int>("UserId")
++                        .HasColumnType("int");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("CredentialId")
++                        .IsUnique();
++
++                    b.ToTable("Passkeys");
++                });
++
++            modelBuilder.Entity("SecLab.Api.Models.User", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("int");
++
++                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
++
++                    b.Property<string>("Address")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("AvatarUrl")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Bio")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("DisplayName")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Email")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<int>("FailedLoginCount")
++                        .HasColumnType("int");
++
++                    b.Property<DateTime?>("LockoutEnd")
++                        .HasColumnType("datetime2");
++
++                    b.Property<string>("Password")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<bool>("PasswordIsHashed")
++                        .HasColumnType("bit");
++
++                    b.Property<string>("Phone")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Role")
++                        .IsRequired()
++                        .HasColumnType("nvarchar(max)");
++
++                    b.Property<string>("Username")
++                        .IsRequired()
++                        .HasMaxLength(32)
++                        .HasColumnType("nvarchar(32)");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("Username")
++                        .IsUnique();
++
++                    b.ToTable("Users");
++                });
++#pragma warning restore 612, 618
++        }
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/src/SecLab.Api/Migrations/AppDbContextModelSnapshot.cs sol16/backend/src/SecLab.Api/Migrations/AppDbContextModelSnapshot.cs
+--- a/backend/src/SecLab.Api/Migrations/AppDbContextModelSnapshot.cs	2026-10-04 21:32:20.561463608 +0200
++++ b/backend/src/SecLab.Api/Migrations/AppDbContextModelSnapshot.cs	2026-10-04 21:33:24.027472833 +0200
+@@ -218,10 +218,14 @@
+ 
+                     b.Property<string>("Username")
+                         .IsRequired()
+-                        .HasColumnType("nvarchar(max)");
++                        .HasMaxLength(32)
++                        .HasColumnType("nvarchar(32)");
+ 
+                     b.HasKey("Id");
+ 
++                    b.HasIndex("Username")
++                        .IsUnique();
++
+                     b.ToTable("Users");
+                 });
+ #pragma warning restore 612, 618
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/AuthorizationMatrixTests.cs sol16/backend/tests/SecLab.Api.Tests/Learner/AuthorizationMatrixTests.cs
+--- a/backend/tests/SecLab.Api.Tests/Learner/AuthorizationMatrixTests.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/AuthorizationMatrixTests.cs	2026-10-04 21:34:37.124319096 +0200
+@@ -0,0 +1,241 @@
++using System.Net;
++using System.Net.Http.Json;
++using System.Text.Json;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Authorization.Infrastructure;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc.Testing;
++using Microsoft.AspNetCore.Routing;
++using Microsoft.Extensions.DependencyInjection;
++using Xunit;
++
++namespace SecLab.Api.Tests.Learner;
++
++// Step 16 - the authorization matrix: every route x every kind of caller -> who may do what.
++// The expectations are written down ONCE, in Table, from the requirements (docs 05, 06) - not copied from what the API happens to do.
++// Three layers: (1) the table and the live endpoints are the same set, (2) the table agrees with the endpoint metadata,
++// (3) behaviour: the live API answers every cell of the matrix the way the table says.
++
++/// <summary>What an endpoint demands. The behaviour for each caller follows from this (see <see cref="AuthorizationMatrixTests.Expected"/>).</summary>
++public enum Access
++{
++    Anonymous,      // public on purpose
++    User,           // any signed-in user (JWT) - the default-deny fallback policy
++    Admin,          // role Admin (policy "Admin")
++    OwnerOnly,      // the owner of the object, nobody else (not even an admin)
++    OwnerOrAdmin,   // the owner or an admin
++    StepUp,         // signed in AND a fresh passkey assertion (X-StepUp) - without it: 403 for everybody
++    ApiKeyRead, ApiKeyWrite, ApiKeyAdmin,   // an API key of at least that level; JWT users are not accepted here
++}
++
++public enum Caller { Anonymous, Owner, Other, Admin, KeyRead, KeyWrite, KeyAdmin }
++public enum Outcome { Allowed, Unauthorized, Forbidden }
++
++public sealed class MatrixFixture : IDisposable
++{
++    readonly EnvScope _env;
++    public WebApplicationFactory<Program> Factory { get; } = new();
++    public Harness H { get; }
++    public Harness.Person Owner { get; }
++    public Harness.Person Other { get; }
++    public Harness.Person Admin { get; }
++    public Dictionary<Caller, string> Keys { get; } = new();
++
++    public MatrixFixture()
++    {
++        // 231 requests from one address in one minute would trip the limiters; the limiters have their own tests (API4).
++        _env = new EnvScope(("RateLimiting__Anonymous", "1000000"), ("RateLimiting__User", "1000000"), ("RateLimiting__Login", "1000000"),
++            ("RateLimiting__ApiKeyRead", "1000000"), ("RateLimiting__ApiKeyWrite", "1000000"), ("RateLimiting__ApiKeyAdmin", "1000000"));
++        H = new Harness(Factory);
++        Owner = H.NewPerson(); Other = H.NewPerson(); Admin = H.NewPerson("Admin");
++        Keys[Caller.KeyRead] = CreateKey(Owner, "read");
++        Keys[Caller.KeyWrite] = CreateKey(Owner, "write");
++        Keys[Caller.KeyAdmin] = CreateKey(Admin, "admin");
++    }
++
++    public string CreateKey(Harness.Person who, string level)
++    {
++        var res = who.Http.PostAsJsonAsync("/api/keys", new { name = "matrix", level }).GetAwaiter().GetResult();
++        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
++        return JsonDocument.Parse(res.Content.ReadAsStringAsync().GetAwaiter().GetResult()).RootElement.GetProperty("apiKey").GetString()!;
++    }
++
++    public void Dispose() { H.Dispose(); Factory.Dispose(); _env.Dispose(); }
++}
++
++[Trait("Step", "16")]
++[Trait("Kind", "Matrix")]
++public class AuthorizationMatrixTests(MatrixFixture fx) : IClassFixture<MatrixFixture>
++{
++    // ---------------- the table: the one place that says who may do what ----------------
++    internal static readonly Dictionary<string, Access> Table = new()
++    {
++        ["ANY /health/live"] = Access.Anonymous,
++        ["ANY /health/ready"] = Access.Anonymous,
++        ["POST /api/auth/login"] = Access.Anonymous,
++        ["POST /api/auth/register"] = Access.Anonymous,
++
++        ["GET /api/me"] = Access.User,
++        ["DELETE /api/me"] = Access.StepUp,
++        ["GET /api/users/{id}"] = Access.User,                    // everybody sees *a* profile; how much is a contract question
++        ["PUT /api/users/{id}"] = Access.OwnerOnly,
++        ["GET /api/users/{id}/friends"] = Access.OwnerOrAdmin,
++        ["GET /api/users/{id}/likes"] = Access.OwnerOrAdmin,
++        ["POST /api/users/{id}/avatar"] = Access.OwnerOnly,
++
++        ["GET /api/blogs"] = Access.User,
++        ["GET /api/blogs/search"] = Access.User,
++        ["POST /api/blogs"] = Access.User,
++        ["PUT /api/blogs/{id}"] = Access.OwnerOnly,
++        ["DELETE /api/blogs/{id}"] = Access.OwnerOrAdmin,
++        ["POST /api/blogs/{id}/like"] = Access.User,
++        ["DELETE /api/blogs/{id}/like"] = Access.User,
++        ["GET /api/timeline"] = Access.User,
++
++        ["GET /api/admin/users"] = Access.Admin,
++        ["PUT /api/admin/users/{id}/role"] = Access.Admin,
++        ["GET /api/debug/crash"] = Access.Admin,
++
++        ["GET /api/keys"] = Access.User,
++        ["POST /api/keys"] = Access.User,
++        ["DELETE /api/keys/{id}"] = Access.OwnerOrAdmin,
++        ["GET /api/partner/blogs"] = Access.ApiKeyRead,
++        ["POST /api/partner/blogs"] = Access.ApiKeyWrite,
++        ["DELETE /api/partner/blogs/{id}"] = Access.ApiKeyAdmin,
++
++        ["GET /api/passkeys"] = Access.User,
++        ["POST /api/passkeys/register/options"] = Access.User,
++        ["POST /api/passkeys/register/complete"] = Access.User,
++        ["POST /api/passkeys/assert/options"] = Access.User,
++        ["POST /api/passkeys/assert/complete"] = Access.User,
++        ["POST /api/tools/link-preview"] = Access.User,
++    };
++
++    /// <summary>These are meant to fail on bad input or on purpose; every other "allowed" answer must not be a 5xx.</summary>
++    static readonly HashSet<string> MayCrash = ["GET /api/debug/crash"];
++
++    /// <summary>The login endpoint answers 401 itself ("wrong credentials") - that is the handler talking, not the authentication middleware.</summary>
++    static readonly HashSet<string> ItsOwn401 = ["POST /api/auth/login"];
++
++    // ---------------- discovery: the live endpoint set ----------------
++    static string Normalize(string pattern) => System.Text.RegularExpressions.Regex.Replace("/" + pattern.Trim('/'), @"\{(\w+):\w+\}", "{$1}");
++
++    internal static List<(string Key, RouteEndpoint Endpoint)> Live(IServiceProvider sp) =>
++        sp.GetRequiredService<EndpointDataSource>().Endpoints.OfType<RouteEndpoint>()
++            .SelectMany(e => (e.Metadata.GetMetadata<HttpMethodMetadata>()?.HttpMethods ?? ["ANY"]).Select(m => ($"{m} {Normalize(e.RoutePattern.RawText ?? "")}", e)))
++            .DistinctBy(x => x.Item1).OrderBy(x => x.Item1).ToList();
++
++    // ---------------- layer 1: the inventory ----------------
++    [Fact]
++    public void Every_endpoint_has_an_entry_in_the_table_and_the_table_has_no_stale_entries()
++    {
++        var live = Live(fx.H.Services).Select(x => x.Key).ToHashSet();
++        Assert.Empty(live.Except(Table.Keys));      // a new route: decide who may call it, add it to the table AND to the behaviour below
++        Assert.Empty(Table.Keys.Except(live));      // a removed or renamed route: delete the entry
++    }
++
++    // ---------------- layer 2: the table against the metadata ----------------
++    [Fact]
++    public void Declared_access_agrees_with_what_the_endpoint_says_about_itself()
++    {
++        foreach (var (key, ep) in Live(fx.H.Services))
++        {
++            var policies = ep.Metadata.OfType<IAuthorizeData>().Select(a => a.Policy).Where(p => p is not null).ToList();
++            var declared = Table[key];
++            if (ep.Metadata.GetMetadata<IAllowAnonymous>() is not null) Assert.True(declared == Access.Anonymous, $"{key} is AllowAnonymous but the table says {declared}");
++            else if (policies.Contains("Admin")) Assert.True(declared == Access.Admin, $"{key} has policy Admin but the table says {declared}");
++            else if (policies.FirstOrDefault(p => p!.StartsWith("ApiKey:")) is { } p)
++                Assert.True(declared.ToString() == "ApiKey" + char.ToUpper(p["ApiKey:".Length]) + p["ApiKey:".Length..][1..], $"{key} has policy {p} but the table says {declared}");
++            else   // no explicit decision: the fallback policy governs - and that must be "signed-in user"
++                Assert.True(declared is Access.User or Access.OwnerOnly or Access.OwnerOrAdmin or Access.StepUp, $"{key} relies on the fallback policy but the table says {declared}");
++        }
++    }
++
++    [Fact]
++    public async Task The_fallback_policy_denies_anonymous_callers()
++    {
++        var fallback = await fx.H.Services.GetRequiredService<IAuthorizationPolicyProvider>().GetFallbackPolicyAsync();
++        Assert.NotNull(fallback);
++        Assert.Contains(fallback!.Requirements, r => r is DenyAnonymousAuthorizationRequirement);
++    }
++
++    // ---------------- layer 3: behaviour ----------------
++    internal static Outcome Expected(Access access, Caller caller)
++    {
++        var jwt = caller is Caller.Owner or Caller.Other or Caller.Admin;
++        return access switch
++        {
++            Access.Anonymous => Outcome.Allowed,
++            Access.User => jwt ? Outcome.Allowed : Outcome.Unauthorized,
++            Access.Admin => caller == Caller.Admin ? Outcome.Allowed : jwt ? Outcome.Forbidden : Outcome.Unauthorized,
++            Access.OwnerOnly => caller == Caller.Owner ? Outcome.Allowed : jwt ? Outcome.Forbidden : Outcome.Unauthorized,
++            Access.OwnerOrAdmin => caller is Caller.Owner or Caller.Admin ? Outcome.Allowed : jwt ? Outcome.Forbidden : Outcome.Unauthorized,
++            Access.StepUp => jwt ? Outcome.Forbidden : Outcome.Unauthorized,
++            Access.ApiKeyRead or Access.ApiKeyWrite or Access.ApiKeyAdmin =>
++                !caller.ToString().StartsWith("Key") ? Outcome.Unauthorized
++                : Rank(caller) >= Rank(access) ? Outcome.Allowed : Outcome.Forbidden,
++            _ => throw new ArgumentOutOfRangeException(nameof(access)),
++        };
++    }
++    static int Rank(Caller c) => c switch { Caller.KeyRead => 1, Caller.KeyWrite => 2, Caller.KeyAdmin => 3, _ => 0 };
++    static int Rank(Access a) => a switch { Access.ApiKeyRead => 1, Access.ApiKeyWrite => 2, _ => 3 };
++
++    public static IEnumerable<object[]> Cells() =>
++        from key in Table.Keys.Order() from caller in Enum.GetValues<Caller>() select new object[] { key, caller };
++
++    [Theory]
++    [MemberData(nameof(Cells))]
++    public async Task Every_route_answers_every_caller_as_the_table_says(string route, Caller caller)
++    {
++        var (method, pattern) = (route.Split(' ')[0], route.Split(' ')[1]);
++        var expected = Expected(Table[route], caller);
++
++        // arrange: fresh objects owned by Owner, so destructive routes can be called once per cell
++        var path = pattern;
++        if (pattern.Contains("{id}"))
++        {
++            var id = pattern switch
++            {
++                var p when p.StartsWith("/api/users/") => fx.Owner.Id,
++                var p when p.StartsWith("/api/admin/users/") => fx.Other.Id,
++                var p when p.StartsWith("/api/keys/") => await NewKeyId(),
++                _ => await NewBlogId(),
++            };
++            path = pattern.Replace("{id}", id.ToString());
++        }
++        var req = new HttpRequestMessage(method == "ANY" ? HttpMethod.Get : new HttpMethod(method), path);
++        if (method is "POST" or "PUT")
++            req.Content = pattern.EndsWith("/avatar")
++                ? new MultipartFormDataContent { { new ByteArrayContent([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0]), "file", "a.png" } }
++                : JsonContent.Create(new { });
++        HttpClient client = caller switch
++        {
++            Caller.Owner => fx.Owner.Http, Caller.Other => fx.Other.Http, Caller.Admin => fx.Admin.Http,
++            _ => fx.H.Anonymous(),
++        };
++        if (fx.Keys.TryGetValue(caller, out var key)) req.Headers.Add("X-Api-Key", key);
++
++        var res = await client.SendAsync(req);
++        var status = (int)res.StatusCode;
++        if (status == 200 && pattern.EndsWith("/avatar"))     // the upload really stored a file: do not leave it in the working tree
++            File.Delete(Repo.Path_("backend/src/SecLab.Api/wwwroot" + JsonDocument.Parse(await res.Content.ReadAsStringAsync()).RootElement.GetProperty("avatarUrl").GetString()));
++
++        var actual = status switch { 401 when !ItsOwn401.Contains(route) => Outcome.Unauthorized, 403 => Outcome.Forbidden, _ => Outcome.Allowed };
++        Assert.True(actual == expected, $"{caller} {route}: expected {expected}, got {status}");
++        if (actual == Outcome.Allowed && !MayCrash.Contains(route)) Assert.True(status < 500, $"{caller} {route}: server error {status}");
++    }
++
++    async Task<int> NewBlogId()
++    {
++        var res = await fx.Owner.Http.PostAsJsonAsync("/api/blogs", new { title = "matrix", body = "<p>x</p>" });
++        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
++        return JsonDocument.Parse(await res.Content.ReadAsStringAsync()).RootElement.GetProperty("id").GetInt32();
++    }
++
++    async Task<int> NewKeyId()
++    {
++        var res = await fx.Owner.Http.PostAsJsonAsync("/api/keys", new { name = "matrix-delete-me", level = "read" });
++        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
++        return JsonDocument.Parse(await res.Content.ReadAsStringAsync()).RootElement.GetProperty("id").GetInt32();
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/ContractTests.cs sol16/backend/tests/SecLab.Api.Tests/Learner/ContractTests.cs
+--- a/backend/tests/SecLab.Api.Tests/Learner/ContractTests.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/ContractTests.cs	2026-10-04 21:18:09.442095942 +0200
+@@ -0,0 +1,211 @@
++using System.Net;
++using System.Net.Http.Json;
++using System.Text.Json;
++using System.Text.RegularExpressions;
++using Microsoft.AspNetCore.Mvc.Testing;
++using SecLab.Api.Models;
++using Xunit;
++
++namespace SecLab.Api.Tests.Learner;
++
++// Step 16 - contract tests: the SHAPE of what the API says, written down and guarded.
++// 1. Snapshots (Learner/Snapshots/*.json): property paths and JSON types of each important response. A new, renamed or removed
++//    field fails the test, so a response can only change on purpose and in a reviewed diff. Update: SECLAB_UPDATE_SNAPSHOTS=1.
++// 2. Invariants over every sample: no password / hash / lock-out / credential property is ever serialised.
++// 3. Every error, whoever produced it, is problem details: same shape, correlation id, nothing about the inside.
++// The API has no OpenAPI document (step 13 keeps it that way), so the contract is whatever the clients actually receive.
++[Trait("Step", "16")]
++[Trait("Kind", "Contract")]
++public class ContractTests(WebApplicationFactory<Program> factory) : IClassFixture<WebApplicationFactory<Program>>, IDisposable
++{
++    readonly EnvScope _env = new(("RateLimiting__Anonymous", "100000"), ("RateLimiting__User", "100000"), ("RateLimiting__Login", "100000"));
++    Harness? _h;
++    Harness H => _h ??= new Harness(factory);
++    public void Dispose() { _h?.Dispose(); _env.Dispose(); }
++
++    static readonly string SnapshotDir = Repo.Path_("backend/tests/SecLab.Api.Tests/Learner/Snapshots");
++
++    // ---------------- sampling: one real response per interesting endpoint ----------------
++    static async Task<JsonElement> Body(HttpResponseMessage res, HttpStatusCode expected)
++    {
++        var text = await res.Content.ReadAsStringAsync();
++        Assert.True(res.StatusCode == expected, $"expected {(int)expected}, got {(int)res.StatusCode}: {text}");
++        return JsonDocument.Parse(text).RootElement.Clone();
++    }
++
++    async Task<Dictionary<string, JsonElement>> Samples()
++    {
++        var owner = H.NewPerson(); var friend = H.NewPerson(); var stranger = H.NewPerson(); var admin = H.NewPerson("Admin");
++        H.InDb(db =>
++        {
++            db.Friendships.Add(new Friendship { UserId = owner.Id, FriendId = friend.Id });
++            db.Friendships.Add(new Friendship { UserId = friend.Id, FriendId = owner.Id });
++            db.SaveChanges(); return 0;
++        });
++        var blog = await Body(await owner.Http.PostAsJsonAsync("/api/blogs", new { title = "t", body = "<p>b</p>" }), HttpStatusCode.Created);
++        var name = "c" + Guid.NewGuid().ToString("N")[..10];
++        var anon = H.Anonymous();
++
++        var s = new Dictionary<string, JsonElement>
++        {
++            ["register"] = await Body(await anon.PostAsJsonAsync("/api/auth/register", new { username = name, password = "correct-horse-battery", displayName = "C", email = $"{name}@example.com" }), HttpStatusCode.Created),
++            ["login"] = await Body(await anon.PostAsJsonAsync("/api/auth/login", new { username = name, password = "correct-horse-battery" }), HttpStatusCode.OK),
++            ["me"] = await Body(await owner.Http.GetAsync("/api/me"), HttpStatusCode.OK),
++            ["user-owner-view"] = await Body(await owner.Http.GetAsync($"/api/users/{owner.Id}"), HttpStatusCode.OK),
++            ["user-friend-view"] = await Body(await friend.Http.GetAsync($"/api/users/{owner.Id}"), HttpStatusCode.OK),
++            ["user-public-view"] = await Body(await stranger.Http.GetAsync($"/api/users/{owner.Id}"), HttpStatusCode.OK),
++            ["friends"] = await Body(await owner.Http.GetAsync($"/api/users/{owner.Id}/friends"), HttpStatusCode.OK),
++            ["blogs-v1"] = await Body(await owner.Http.GetAsync("/api/blogs"), HttpStatusCode.OK),
++            ["blogs-v2"] = await Body(await owner.Http.GetAsync("/api/blogs?api-version=2.0"), HttpStatusCode.OK),
++            ["blog-created"] = blog,
++            ["timeline"] = await Body(await friend.Http.GetAsync("/api/timeline"), HttpStatusCode.OK),
++            ["admin-users"] = await Body(await admin.Http.GetAsync("/api/admin/users"), HttpStatusCode.OK),
++            ["key-created"] = await Body(await owner.Http.PostAsJsonAsync("/api/keys", new { name = "contract", level = "read" }), HttpStatusCode.Created),
++            ["keys-list"] = await Body(await owner.Http.GetAsync("/api/keys"), HttpStatusCode.OK),
++        };
++        return s;
++    }
++
++    // ---------------- 1. snapshots ----------------
++    /// <summary>"$.items[].likes" -> "number": every property path with its JSON type(s); arrays are merged over all their elements.</summary>
++    internal static SortedDictionary<string, string> Shape(JsonElement e)
++    {
++        var map = new SortedDictionary<string, HashSet<string>>();
++        void Walk(JsonElement x, string path)
++        {
++            Add(path, x.ValueKind switch { JsonValueKind.True or JsonValueKind.False => "boolean", var k => k.ToString().ToLowerInvariant() });
++            if (x.ValueKind == JsonValueKind.Object) foreach (var p in x.EnumerateObject()) Walk(p.Value, path + "." + p.Name);
++            else if (x.ValueKind == JsonValueKind.Array) foreach (var i in x.EnumerateArray()) Walk(i, path + "[]");
++        }
++        void Add(string path, string type) { if (!map.TryGetValue(path, out var set)) map[path] = set = []; set.Add(type); }
++        Walk(e, "$");
++        return new(map.ToDictionary(kv => kv.Key, kv => string.Join("|", kv.Value.Order())));
++    }
++
++    static readonly string[] SnapshotNames =
++        ["register", "login", "me", "user-owner-view", "user-friend-view", "user-public-view", "friends", "blogs-v1", "blogs-v2", "blog-created", "timeline", "admin-users", "key-created", "keys-list"];
++
++    [Fact]
++    public async Task Responses_have_exactly_the_recorded_shape()
++    {
++        var samples = await Samples();
++        var update = Environment.GetEnvironmentVariable("SECLAB_UPDATE_SNAPSHOTS") == "1";
++        var problems = new List<string>();
++        foreach (var name in SnapshotNames)
++        {
++            var actual = Shape(samples[name]);
++            var file = Path.Combine(SnapshotDir, name + ".json");
++            if (update) { Directory.CreateDirectory(SnapshotDir); File.WriteAllText(file, JsonSerializer.Serialize(actual, new JsonSerializerOptions { WriteIndented = true }) + "\n"); continue; }
++            if (!File.Exists(file)) { problems.Add($"{name}: no snapshot (run once with SECLAB_UPDATE_SNAPSHOTS=1, review the file, commit it)"); continue; }
++            var expected = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(file))!;
++            foreach (var (path, type) in actual) if (!expected.TryGetValue(path, out var t)) problems.Add($"{name}: NEW   {path} ({type})"); else if (t != type) problems.Add($"{name}: TYPE  {path} {t} -> {type}");
++            foreach (var path in expected.Keys.Except(actual.Keys)) problems.Add($"{name}: GONE  {path}");
++        }
++        Assert.True(problems.Count == 0, "the contract changed:\n" + string.Join("\n", problems));
++    }
++
++    // ---------------- 2. what must never be serialised ----------------
++    static readonly Regex Forbidden = new(@"(?i)(pass(word|wd)?|hash|salt|secret|lockout|failedlogin|publickey|credentialid|userhandle|signcount|token|apikey)");
++
++    /// <summary>Known, documented exceptions: sample name -> property that is allowed to match.</summary>
++    static readonly (string Sample, string Path)[] Exceptions =
++    [
++        ("key-created", "$.apiKey"),     // the one moment a new key is shown (docs/06)
++        ("login", "$.token"),            // LEGACY (see docs/03): /api/auth/login still returns a placeholder 'token' (the user id). Delete this line when that goes away.
++    ];
++
++    [Fact]
++    public async Task No_response_ever_contains_a_property_that_looks_like_a_credential_or_a_lock_out_detail()
++    {
++        var offenders = new List<string>();
++        foreach (var (name, json) in await Samples())
++            foreach (var path in Shape(json).Keys)
++            {
++                var leaf = path[(path.LastIndexOfAny(['.', ']']) + 1)..];
++                if (Forbidden.IsMatch(leaf) && !Exceptions.Contains((name, path))) offenders.Add($"{name}: {path}");
++            }
++        Assert.True(offenders.Count == 0, "sensitive-looking properties in responses:\n" + string.Join("\n", offenders));
++    }
++
++    [Fact]
++    public void The_forbidden_pattern_itself_catches_the_names_it_is_meant_to_catch()
++    {
++        foreach (var bad in new[] { "password", "Password", "passwordHash", "passwordIsHashed", "keyHash", "failedLoginCount", "lockoutEnd", "apiKey", "accessToken", "publicKey", "signCount", "userHandle", "salt", "clientSecret" })
++            Assert.Matches(Forbidden, bad);
++        foreach (var fine in new[] { "id", "username", "displayName", "email", "phone", "address", "bio", "role", "createdAt", "likes", "title", "body" })
++            Assert.DoesNotMatch(Forbidden, fine);
++    }
++
++    [Fact]
++    public void The_entity_classes_that_hold_secrets_are_not_the_contract_types()
++    {
++        // The returned record types must not expose entity fields that hold secrets; the User entity itself has them.
++        var secrets = typeof(User).GetProperties().Select(p => p.Name).Where(n => Forbidden.IsMatch(n)).Order().ToArray();
++        Assert.Equal(new[] { "FailedLoginCount", "LockoutEnd", "Password", "PasswordIsHashed" }, secrets);
++        foreach (var contract in new[] { typeof(Endpoints.Api.PublicProfile), typeof(Endpoints.Api.FriendProfile), typeof(Endpoints.Api.FullProfile), typeof(Endpoints.Api.BlogView) })
++            Assert.Empty(contract.GetProperties().Select(p => p.Name).Intersect(secrets));
++    }
++
++    // ---------------- 3. errors are problem details ----------------
++    async Task<List<(string What, int Expected, HttpResponseMessage Res)>> ErrorSamples()
++    {
++        var p = H.NewPerson(); var admin = H.NewPerson("Admin"); var name = "e" + Guid.NewGuid().ToString("N")[..10];
++        await H.Anonymous().PostAsJsonAsync("/api/auth/register", new { username = name, password = "correct-horse-battery", displayName = "E", email = $"{name}@example.com" });
++        var textPlain = new HttpRequestMessage(HttpMethod.Post, "/api/blogs") { Content = new StringContent("title=x", System.Text.Encoding.UTF8, "text/plain") };
++        var patch = new HttpRequestMessage(HttpMethod.Patch, "/api/blogs");
++        return
++        [
++            ("400 validation", 400, await p.Http.PostAsJsonAsync("/api/blogs", new { title = "", body = "" })),
++            ("400 bad page", 400, await p.Http.GetAsync("/api/blogs?api-version=2.0&pageSize=9999")),
++            ("401 anonymous", 401, await H.Anonymous().GetAsync("/api/me")),
++            ("401 login", 401, await H.Anonymous().PostAsJsonAsync("/api/auth/login", new { username = name, password = "wrong-password-xx" })),
++            ("403 forbidden", 403, await p.Http.GetAsync("/api/admin/users")),
++            ("404 no route", 404, await p.Http.GetAsync("/api/does-not-exist")),
++            ("404 no object", 404, await p.Http.GetAsync("/api/users/2000000000")),
++            ("405 method", 405, await p.Http.SendAsync(patch)),
++            ("409 conflict", 409, await H.Anonymous().PostAsJsonAsync("/api/auth/register", new { username = name, password = "correct-horse-battery", displayName = "E", email = $"{name}@example.com" })),
++            ("415 media type", 415, await p.Http.SendAsync(textPlain)),
++            ("500 crash", 500, await admin.Http.GetAsync("/api/debug/crash")),
++        ];
++    }
++
++    [Fact]
++    public async Task Every_error_is_problem_details_with_a_correlation_id_and_nothing_about_the_inside()
++    {
++        foreach (var (what, expected, res) in await ErrorSamples())
++        {
++            Assert.True((int)res.StatusCode == expected, $"{what}: got {(int)res.StatusCode}");
++            Assert.True(res.Content.Headers.ContentType?.MediaType == "application/problem+json", $"{what}: content type {res.Content.Headers.ContentType}");
++            var text = await res.Content.ReadAsStringAsync();
++            var json = JsonDocument.Parse(text).RootElement;
++            Assert.Equal(expected, json.GetProperty("status").GetInt32());
++            Assert.False(string.IsNullOrWhiteSpace(json.GetProperty("title").GetString()), $"{what}: title");
++            Assert.False(string.IsNullOrWhiteSpace(json.GetProperty("traceId").GetString()), $"{what}: traceId");
++            Assert.True(res.Headers.Contains("X-Trace-Id"), $"{what}: X-Trace-Id header");
++
++            var names = Shape(json).Keys.Select(k => k.TrimStart('$', '.')).Where(k => k.Length > 0 && !k.Contains('.')).ToHashSet(StringComparer.OrdinalIgnoreCase);
++            Assert.Subset(new HashSet<string>(["type", "title", "status", "detail", "instance", "traceId", "errors", "errors[]"], StringComparer.OrdinalIgnoreCase), names);
++            foreach (var leak in new[] { "stackTrace", "exception", "Exception", " at SecLab", "Boom", "Server=", "User Id", ".cs:line", "System." }) Assert.DoesNotContain(leak, text);
++        }
++    }
++
++    [Fact]
++    public async Task Validation_errors_name_the_fields_that_failed_and_nothing_else()
++    {
++        var p = H.NewPerson();
++        var json = await Body(await p.Http.PostAsJsonAsync("/api/blogs", new { title = "", body = "" }), HttpStatusCode.BadRequest);
++        var fields = json.GetProperty("errors").EnumerateObject().Select(x => x.Name).Order(StringComparer.OrdinalIgnoreCase).ToArray();
++        Assert.Equal(new[] { "body", "title" }, fields.Select(f => f.ToLowerInvariant()));
++    }
++
++    // ---------------- versions are part of the contract ----------------
++    [Fact]
++    public async Task Version_1_is_a_bare_array_and_version_2_is_a_paged_envelope()
++    {
++        var s = await Samples();
++        Assert.Equal(JsonValueKind.Array, s["blogs-v1"].ValueKind);
++        Assert.Equal(JsonValueKind.Object, s["blogs-v2"].ValueKind);
++        Assert.Equal(new[] { "items", "page", "pageSize", "total" }, s["blogs-v2"].EnumerateObject().Select(x => x.Name).Order().ToArray());
++        Assert.True(s["blogs-v2"].GetProperty("items").GetArrayLength() <= 20);
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/DatabaseIntegrationTests.cs sol16/backend/tests/SecLab.Api.Tests/Learner/DatabaseIntegrationTests.cs
+--- a/backend/tests/SecLab.Api.Tests/Learner/DatabaseIntegrationTests.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/DatabaseIntegrationTests.cs	2026-10-04 21:20:37.764007952 +0200
+@@ -0,0 +1,182 @@
++using System.Net;
++using System.Net.Http.Json;
++using System.Text.Json;
++using Microsoft.AspNetCore.Mvc.Testing;
++using Microsoft.EntityFrameworkCore;
++using Xunit;
++
++namespace SecLab.Api.Tests.Learner;
++
++// Step 16 - integration tests: the real HTTP pipeline, the real EF Core model and the real SQL Server from docker compose
++// (the same engine, the same least-privilege login, the same migrations as production - not an in-memory fake that has
++// no constraints, no permissions and different SQL translation).
++// Rules these tests follow: every test creates its own uniquely named data (no clean-up order, no shared rows); nothing is
++// asserted about rows it did not create; limits that are not under test are lifted; the test asks the DATABASE, not only the API.
++[Trait("Step", "16")]
++[Trait("Kind", "Integration")]
++public class DatabaseIntegrationTests(WebApplicationFactory<Program> factory) : IClassFixture<WebApplicationFactory<Program>>, IDisposable
++{
++    readonly EnvScope _env = new(("RateLimiting__Anonymous", "100000"), ("RateLimiting__User", "100000"), ("RateLimiting__Login", "100000"));
++    readonly List<Harness> _harnesses = [];
++    public void Dispose() { foreach (var h in _harnesses) h.Dispose(); _env.Dispose(); }
++
++    Harness NewHost() { var h = new Harness(factory); _harnesses.Add(h); return h; }
++    static string Unique(string prefix) => prefix + Guid.NewGuid().ToString("N")[..10];
++
++    [Fact]
++    public void The_tests_run_as_the_application_login_on_a_fully_migrated_database()
++    {
++        var h = NewHost();
++        var (login, pending) = h.InDb(db =>
++        {
++            var conn = db.Database.GetDbConnection(); conn.Open();
++            using var cmd = conn.CreateCommand(); cmd.CommandText = "SELECT SUSER_NAME()";
++            var name = (string)cmd.ExecuteScalar()!; conn.Close();
++            return (name, db.Database.GetPendingMigrations().ToList());
++        });
++        Assert.Equal("seclab_app", login);       // not sa: the suite exercises the privileges production has
++        Assert.Empty(pending);
++    }
++
++    [Fact]
++    public async Task A_registered_password_is_stored_as_a_salted_hash_and_never_as_text()
++    {
++        var h = NewHost();
++        var name = Unique("i"); const string password = "correct-horse-battery-staple";
++        var res = await h.Anonymous().PostAsJsonAsync("/api/auth/register", new { username = name, password, displayName = "I", email = $"{name}@example.com" });
++        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
++
++        var row = h.InDb(db => db.Users.AsNoTracking().Single(u => u.Username == name));
++        Assert.True(row.PasswordIsHashed);
++        Assert.NotEqual(password, row.Password);
++        Assert.DoesNotContain(password, row.Password);
++        Assert.False(h.DatabaseContains(password), "the password appears somewhere in the database");
++
++        // two users with the same password get different hashes (salt)
++        var other = Unique("j");
++        await h.Anonymous().PostAsJsonAsync("/api/auth/register", new { username = other, password, displayName = "J", email = $"{other}@example.com" });
++        Assert.NotEqual(row.Password, h.InDb(db => db.Users.AsNoTracking().Single(u => u.Username == other).Password));
++    }
++
++    [Fact]
++    public async Task A_lock_out_survives_a_restart_because_it_lives_in_the_database()
++    {
++        var first = NewHost();
++        var name = Unique("l"); const string password = "correct-horse-battery-staple";
++        await first.Anonymous().PostAsJsonAsync("/api/auth/register", new { username = name, password, displayName = "L", email = $"{name}@example.com" });
++        for (var i = 0; i < 5; i++) Assert.Equal(HttpStatusCode.Unauthorized, (await first.Anonymous().PostAsJsonAsync("/api/auth/login", new { username = name, password = "wrong-" + i })).StatusCode);
++        Assert.True(first.InDb(db => db.Users.Single(u => u.Username == name).LockoutEnd) > DateTime.UtcNow);
++
++        var restarted = NewHost();      // a second host = a "restart": new process memory, same database
++        var res = await restarted.Anonymous().PostAsJsonAsync("/api/auth/login", new { username = name, password });
++        Assert.Equal(HttpStatusCode.Unauthorized, res.StatusCode);                       // the right password is still refused
++
++        restarted.InDb(db => { db.Users.Where(u => u.Username == name).ExecuteUpdate(s => s.SetProperty(u => u.LockoutEnd, (DateTime?)null)); return 0; });   // time passes
++        Assert.Equal(HttpStatusCode.OK, (await restarted.Anonymous().PostAsJsonAsync("/api/auth/login", new { username = name, password })).StatusCode);
++    }
++
++    [Fact]
++    public async Task An_api_key_is_stored_as_a_hash_works_until_revoked_and_the_secret_exists_nowhere_in_the_database()
++    {
++        var h = NewHost();
++        var owner = h.NewPerson();
++        var created = JsonDocument.Parse(await (await owner.Http.PostAsJsonAsync("/api/keys", new { name = "it", level = "write" })).Content.ReadAsStringAsync()).RootElement;
++        var (id, key) = (created.GetProperty("id").GetInt32(), created.GetProperty("apiKey").GetString()!);
++        var secret = key.Split('_')[2];
++
++        var row = h.InDb(db => db.ApiKeys.AsNoTracking().Single(k => k.Id == id));
++        Assert.Equal(32, row.KeyHash.Length);
++        Assert.Equal(owner.Id, row.OwnerId);
++        Assert.False(h.DatabaseContains(secret));
++
++        HttpRequestMessage Call() { var r = new HttpRequestMessage(HttpMethod.Get, "/api/partner/blogs"); r.Headers.Add("X-Api-Key", key); return r; }
++        Assert.Equal(HttpStatusCode.OK, (await h.Anonymous().SendAsync(Call())).StatusCode);
++        Assert.NotNull(h.InDb(db => db.ApiKeys.Single(k => k.Id == id).LastUsedAt));          // use is recorded
++
++        Assert.Equal(HttpStatusCode.NoContent, (await owner.Http.DeleteAsync($"/api/keys/{id}")).StatusCode);
++        Assert.NotNull(h.InDb(db => db.ApiKeys.Single(k => k.Id == id).RevokedAt));
++        Assert.Equal(HttpStatusCode.Unauthorized, (await h.Anonymous().SendAsync(Call())).StatusCode);   // and a different host sees the revocation immediately
++    }
++
++    [Fact]
++    public async Task Personal_data_is_encrypted_in_the_table_but_readable_through_the_api()
++    {
++        var h = NewHost();
++        var p = h.NewPerson();
++        var phone = "+47 " + Random.Shared.Next(100_000_000, 999_999_999);
++        Assert.Equal(HttpStatusCode.OK, (await p.Http.PutAsJsonAsync($"/api/users/{p.Id}", new { phone, address = "Hemmelig gate 7" })).StatusCode);
++
++        var me = JsonDocument.Parse(await (await p.Http.GetAsync("/api/me")).Content.ReadAsStringAsync()).RootElement;
++        Assert.Equal(phone, me.GetProperty("phone").GetString());
++        Assert.False(h.DatabaseContains(phone));
++        Assert.False(h.DatabaseContains("Hemmelig gate 7"));
++    }
++
++    [Fact]
++    public async Task Deleting_a_blog_leaves_no_orphaned_likes()
++    {
++        var h = NewHost();
++        var (author, a, b) = (h.NewPerson(), h.NewPerson(), h.NewPerson());
++        var id = await NewBlog(author);
++        Assert.Equal(HttpStatusCode.NoContent, (await a.Http.PostAsync($"/api/blogs/{id}/like", null)).StatusCode);
++        Assert.Equal(HttpStatusCode.NoContent, (await b.Http.PostAsync($"/api/blogs/{id}/like", null)).StatusCode);
++        Assert.Equal(2, h.InDb(db => db.BlogLikes.Count(l => l.BlogId == id)));
++
++        Assert.Equal(HttpStatusCode.NoContent, (await author.Http.DeleteAsync($"/api/blogs/{id}")).StatusCode);
++        Assert.Equal(0, h.InDb(db => db.BlogLikes.Count(l => l.BlogId == id)));
++        Assert.Equal(0, h.InDb(db => db.Blogs.Count(x => x.Id == id)));
++    }
++
++    // ---------------- concurrency: what a sequential test can never see ----------------
++    // "Check, then insert" is two statements. Two requests can both pass the check. Only the database can make the second one fail.
++
++    [Fact]
++    public async Task Concurrent_duplicate_likes_are_idempotent_and_never_a_server_error()
++    {
++        var h = NewHost();
++        var (author, fan) = (h.NewPerson(), h.NewPerson());
++        for (var round = 0; round < 5; round++)        // a race is a matter of timing: several rounds make "never" mean never
++        {
++            var id = await NewBlog(author);
++            var answers = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => fan.Http.PostAsync($"/api/blogs/{id}/like", null)));
++
++            Assert.All(answers, r => Assert.Equal(HttpStatusCode.NoContent, r.StatusCode));
++            Assert.Equal(1, h.InDb(db => db.BlogLikes.Count(l => l.BlogId == id && l.UserId == fan.Id)));
++        }
++    }
++
++    [Fact]
++    public async Task Concurrent_registrations_of_the_same_username_create_exactly_one_account()
++    {
++        var h = NewHost();
++        var name = Unique("c");
++        var answers = await Task.WhenAll(Enumerable.Range(0, 6).Select(_ => h.Anonymous().PostAsJsonAsync("/api/auth/register",
++            new { username = name, password = "correct-horse-battery-staple", displayName = "C", email = $"{name}@example.com" })));
++
++        Assert.Equal(1, answers.Count(r => r.StatusCode == HttpStatusCode.Created));
++        Assert.All(answers.Where(r => r.StatusCode != HttpStatusCode.Created), r => Assert.Equal(HttpStatusCode.Conflict, r.StatusCode));   // a clean 409, not a 500
++        Assert.Equal(1, h.InDb(db => db.Users.Count(u => u.Username == name)));                                                              // the database is the judge
++    }
++
++    [Fact]
++    public void The_database_itself_rejects_a_duplicate_where_the_model_says_unique()
++    {
++        var h = NewHost();
++        var p = h.NewPerson();
++        var prefix = Unique("P")[..8];
++        var ex = Assert.ThrowsAny<DbUpdateException>(() => h.InDb(db =>
++        {
++            db.ApiKeys.Add(new SecLab.Api.Models.ApiKey { OwnerId = p.Id, Name = "a", Prefix = prefix, KeyHash = new byte[32], Level = "read" });
++            db.ApiKeys.Add(new SecLab.Api.Models.ApiKey { OwnerId = p.Id, Name = "b", Prefix = prefix, KeyHash = new byte[32], Level = "read" });
++            return db.SaveChanges();
++        }));
++        Assert.Contains("IX_ApiKeys_Prefix", ex.InnerException?.Message ?? ex.Message);
++    }
++
++    static async Task<int> NewBlog(Harness.Person who)
++    {
++        var res = await who.Http.PostAsJsonAsync("/api/blogs", new { title = Unique("b"), body = "<p>x</p>" });
++        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
++        return JsonDocument.Parse(await res.Content.ReadAsStringAsync()).RootElement.GetProperty("id").GetInt32();
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/OwaspNegativeTests.cs sol16/backend/tests/SecLab.Api.Tests/Learner/OwaspNegativeTests.cs
+--- a/backend/tests/SecLab.Api.Tests/Learner/OwaspNegativeTests.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/OwaspNegativeTests.cs	2026-10-04 21:37:12.835394024 +0200
+@@ -0,0 +1,366 @@
++using System.Net;
++using System.Net.Http.Json;
++using System.Text.Json;
++using Microsoft.AspNetCore.Mvc.Testing;
++using Microsoft.EntityFrameworkCore;
++using Xunit;
++
++namespace SecLab.Api.Tests.Learner;
++
++// Step 16 - negative tests, one or more per OWASP API Security Top 10 (2023) risk.
++// A negative test states what must NOT be possible and then tries it. It is green when the attack fails - and it must go red
++// when the control is removed (docs/attack-scripts/16-mutants.sh checks that for several controls).
++[Trait("Step", "16")]
++[Trait("Kind", "Negative")]
++public class OwaspNegativeTests(WebApplicationFactory<Program> factory) : IClassFixture<WebApplicationFactory<Program>>, IDisposable
++{
++    readonly List<IDisposable> _cleanup = [];
++    public void Dispose() { foreach (var c in _cleanup) c.Dispose(); }
++
++    /// <summary>A harness with the given configuration overrides (set BEFORE the host is built) and generous limits for everything not named.</summary>
++    Harness Start(params (string, string)[] settings)
++    {
++        var defaults = new Dictionary<string, string>
++        {
++            ["RateLimiting__Anonymous"] = "100000", ["RateLimiting__User"] = "100000", ["RateLimiting__Login"] = "100000",
++        };
++        foreach (var (k, v) in settings) defaults[k] = v;
++        _cleanup.Add(new EnvScope(defaults.Select(kv => (kv.Key, kv.Value)).ToArray()));
++        var h = new Harness(factory);
++        _cleanup.Add(h);
++        return h;
++    }
++
++    static async Task<JsonElement> Json(HttpResponseMessage res) => JsonDocument.Parse(await res.Content.ReadAsStringAsync()).RootElement.Clone();
++
++    static async Task<int> CreateBlog(Harness.Person who, string title = "mine")
++    {
++        var res = await who.Http.PostAsJsonAsync("/api/blogs", new { title, body = "<p>text</p>" });
++        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
++        return (await Json(res)).GetProperty("id").GetInt32();
++    }
++
++    // ================= API1 Broken Object Level Authorization =================
++
++    [Fact]
++    [OwaspApi("API1")]
++    public async Task Another_user_cannot_edit_delete_or_read_private_data_of_my_objects()
++    {
++        var h = Start();
++        var (owner, intruder) = (h.NewPerson(), h.NewPerson());
++        var blogId = await CreateBlog(owner, "original");
++
++        Assert.Equal(HttpStatusCode.Forbidden, (await intruder.Http.PutAsJsonAsync($"/api/blogs/{blogId}", new { title = "hacked" })).StatusCode);
++        Assert.Equal(HttpStatusCode.Forbidden, (await intruder.Http.DeleteAsync($"/api/blogs/{blogId}")).StatusCode);
++        Assert.Equal(HttpStatusCode.Forbidden, (await intruder.Http.PutAsJsonAsync($"/api/users/{owner.Id}", new { bio = "hacked" })).StatusCode);
++        Assert.Equal(HttpStatusCode.Forbidden, (await intruder.Http.GetAsync($"/api/users/{owner.Id}/likes")).StatusCode);
++        Assert.Equal(HttpStatusCode.Forbidden, (await intruder.Http.GetAsync($"/api/users/{owner.Id}/friends")).StatusCode);
++
++        // "403" is not enough: prove that nothing changed.
++        Assert.Equal("original", h.InDb(db => db.Blogs.Single(b => b.Id == blogId).Title));
++        Assert.Equal("bio", h.InDb(db => db.Users.Single(u => u.Id == owner.Id).Bio));
++    }
++
++    [Fact]
++    [OwaspApi("API1")]
++    public async Task Ids_that_do_not_exist_and_ids_that_are_not_mine_do_not_crash_or_reveal_anything()
++    {
++        var h = Start();
++        var p = h.NewPerson();
++        foreach (var url in new[] { "/api/users/0", "/api/users/-1", "/api/users/2147483647" })
++        {
++            var res = await p.Http.GetAsync(url);
++            Assert.True(res.StatusCode == HttpStatusCode.NotFound, $"{url} -> {(int)res.StatusCode}");
++            Assert.DoesNotContain("email", await res.Content.ReadAsStringAsync(), StringComparison.OrdinalIgnoreCase);
++        }
++        Assert.Equal(HttpStatusCode.NotFound, (await p.Http.GetAsync("/api/users/abc")).StatusCode);    // not an int: no route, not an exception
++    }
++
++    // ================= API2 Broken Authentication =================
++
++    [Theory]
++    [InlineData("alg-none")] [InlineData("wrong-key")] [InlineData("expired")] [InlineData("wrong-audience")] [InlineData("wrong-issuer")] [InlineData("garbage")]
++    [OwaspApi("API2")]
++    public async Task A_token_that_is_not_exactly_right_is_refused(string kind)
++    {
++        var h = Start();
++        var p = h.NewPerson();
++        var idp = new TestIdp();                      // only used to mint tokens; the host above trusts its own key
++        _cleanup.Add(idp);
++        var token = kind switch
++        {
++            "alg-none" => TestIdp.UnsignedToken(p.Username),
++            "wrong-key" => idp.Token(p.Username, signWith: TestIdp.AttackerKey()),
++            "expired" => idp.Token(p.Username, expiresIn: TimeSpan.FromMinutes(-10)),
++            "wrong-audience" => idp.Token(p.Username, audience: "someone-else"),
++            "wrong-issuer" => idp.Token(p.Username, issuer: "https://evil.example/realms/x"),
++            _ => "not.a.jwt",
++        };
++        var req = new HttpRequestMessage(HttpMethod.Get, "/api/me");
++        req.Headers.Authorization = new("Bearer", token);
++        var res = await h.Anonymous().SendAsync(req);
++        Assert.Equal(HttpStatusCode.Unauthorized, res.StatusCode);
++    }
++
++    async Task<string> Register(HttpClient anon, string prefix)
++    {
++        var name = prefix + Guid.NewGuid().ToString("N")[..10];
++        Assert.Equal(HttpStatusCode.Created, (await anon.PostAsJsonAsync("/api/auth/register",
++            new { username = name, password = "correct-horse-battery", displayName = "V", email = $"{name}@example.com" })).StatusCode);
++        return name;
++    }
++
++    [Fact]
++    [OwaspApi("API2")]
++    public async Task Login_does_not_reveal_whether_the_user_exists()
++    {
++        var anon = Start().Anonymous();
++        var name = await Register(anon, "v");
++
++        var unknown = await anon.PostAsJsonAsync("/api/auth/login", new { username = "nobody-" + name, password = "whatever-123456" });
++        var wrong = await anon.PostAsJsonAsync("/api/auth/login", new { username = name, password = "whatever-123456" });
++        Assert.Equal(HttpStatusCode.Unauthorized, unknown.StatusCode);
++        Assert.Equal(HttpStatusCode.Unauthorized, wrong.StatusCode);
++        Assert.Equal(Strip(await unknown.Content.ReadAsStringAsync()), Strip(await wrong.Content.ReadAsStringAsync()));   // same answer, byte for byte (but the trace id)
++    }
++
++    static string Strip(string problem) => System.Text.RegularExpressions.Regex.Replace(problem, "\"traceId\":\"[^\"]*\"", "");
++
++    [Fact]
++    [OwaspApi("API2")]
++    public async Task Five_failed_logins_lock_the_account_and_four_do_not()
++    {
++        var anon = Start().Anonymous();
++        var name = await Register(anon, "k");
++        Task<HttpResponseMessage> Login(string password) => anon.PostAsJsonAsync("/api/auth/login", new { username = name, password });
++
++        for (var i = 0; i < 4; i++) Assert.Equal(HttpStatusCode.Unauthorized, (await Login("bad-guess-" + i)).StatusCode);
++        Assert.Equal(HttpStatusCode.OK, (await Login("correct-horse-battery")).StatusCode);          // four failures: not locked - and a success resets the counter
++
++        for (var i = 0; i < 5; i++) await Login("bad-guess-" + i);
++        var locked = await Login("correct-horse-battery");
++        Assert.Equal(HttpStatusCode.Unauthorized, locked.StatusCode);                                // five failures: even the right password is refused ...
++        var wrong = await Login("bad-guess-x");
++        Assert.Equal(Strip(await wrong.Content.ReadAsStringAsync()), Strip(await locked.Content.ReadAsStringAsync()));   // ... and it looks like any other failure
++    }
++
++    // ================= API3 Broken Object Property Level Authorization =================
++
++    [Fact]
++    [OwaspApi("API3")]
++    public async Task Mass_assignment_cannot_change_role_username_password_or_id()
++    {
++        var h = Start();
++        var p = h.NewPerson();
++        var before = h.InDb(db => db.Users.AsNoTracking().Single(u => u.Id == p.Id));
++
++        var res = await p.Http.PutAsJsonAsync($"/api/users/{p.Id}", new { bio = "new bio", role = "Admin", username = "root", password = "pwned", id = 1, passwordIsHashed = false });
++        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
++
++        var after = h.InDb(db => db.Users.AsNoTracking().Single(u => u.Id == p.Id));
++        Assert.Equal("new bio", after.Bio);                        // the legitimate part was applied
++        Assert.Equal("User", after.Role);
++        Assert.Equal(before.Username, after.Username);
++        Assert.Equal(before.Password, after.Password);
++        Assert.Equal(before.Id, after.Id);
++    }
++
++    [Fact]
++    [OwaspApi("API3")]
++    public async Task Registration_ignores_fields_that_are_not_part_of_the_contract()
++    {
++        var h = Start();
++        var name = "r" + Guid.NewGuid().ToString("N")[..10];
++        var res = await h.Anonymous().PostAsJsonAsync("/api/auth/register",
++            new { username = name, password = "correct-horse-battery", displayName = "R", email = $"{name}@example.com", role = "Admin" });
++        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
++        Assert.Equal("User", h.InDb(db => db.Users.Single(u => u.Username == name).Role));
++    }
++
++    [Fact]
++    [OwaspApi("API3")]
++    public async Task A_stranger_sees_the_public_profile_only()
++    {
++        var h = Start();
++        var (owner, stranger) = (h.NewPerson(), h.NewPerson());
++        var json = await Json(await stranger.Http.GetAsync($"/api/users/{owner.Id}"));
++        var names = json.EnumerateObject().Select(p => p.Name).Order().ToArray();
++        Assert.Equal(new[] { "avatarUrl", "bio", "displayName", "id", "username" }, names);   // no email, phone, address, role
++    }
++
++    // ================= API4 Unrestricted Resource Consumption =================
++
++    [Fact]
++    [OwaspApi("API4")]
++    public async Task Too_many_anonymous_requests_are_answered_with_429_and_Retry_After()
++    {
++        var h = Start(("RateLimiting__Anonymous", "3"), ("RateLimiting__WindowSeconds", "600"));
++        var anon = h.Anonymous();
++        for (var i = 0; i < 3; i++) Assert.Equal(HttpStatusCode.Unauthorized, (await anon.GetAsync("/api/me")).StatusCode);
++        var res = await anon.GetAsync("/api/me");
++        Assert.Equal(HttpStatusCode.TooManyRequests, res.StatusCode);
++        Assert.True(res.Headers.Contains("Retry-After"));
++    }
++
++    [Theory]
++    [InlineData("/api/blogs?api-version=2.0&pageSize=1000")]
++    [InlineData("/api/blogs?api-version=2.0&pageSize=0")]
++    [InlineData("/api/blogs?api-version=2.0&page=0")]
++    [InlineData("/api/blogs?api-version=2.0&page=-5")]
++    [OwaspApi("API4")]
++    public async Task Page_parameters_are_bounded(string url)
++    {
++        var p = Start().NewPerson();
++        Assert.Equal(HttpStatusCode.BadRequest, (await p.Http.GetAsync(url)).StatusCode);
++    }
++
++    [Fact]
++    [OwaspApi("API4")]
++    public async Task Oversized_input_is_rejected_not_stored()
++    {
++        var h = Start();
++        var p = h.NewPerson();
++        Assert.Equal(HttpStatusCode.BadRequest, (await p.Http.PostAsJsonAsync("/api/blogs", new { title = new string('t', 121), body = "x" })).StatusCode);
++        Assert.Equal(HttpStatusCode.BadRequest, (await p.Http.PostAsJsonAsync("/api/blogs", new { title = "t", body = new string('b', 10_001) })).StatusCode);
++        Assert.Equal(HttpStatusCode.BadRequest, (await p.Http.GetAsync("/api/blogs/search?q=" + new string('q', 101))).StatusCode);
++        Assert.Equal(0, h.InDb(db => db.Blogs.Count(b => b.AuthorId == p.Id)));
++    }
++
++    // ================= API5 Broken Function Level Authorization =================
++
++    [Fact]
++    [OwaspApi("API5")]
++    public async Task A_normal_user_cannot_use_admin_functions()
++    {
++        var h = Start();
++        var (user, victim) = (h.NewPerson(), h.NewPerson());
++        Assert.Equal(HttpStatusCode.Forbidden, (await user.Http.GetAsync("/api/admin/users")).StatusCode);
++        Assert.Equal(HttpStatusCode.Forbidden, (await user.Http.PutAsJsonAsync($"/api/admin/users/{victim.Id}/role", new { role = "Admin" })).StatusCode);
++        Assert.Equal(HttpStatusCode.Forbidden, (await user.Http.PutAsJsonAsync($"/api/admin/users/{user.Id}/role", new { role = "Admin" })).StatusCode);
++        Assert.Equal(HttpStatusCode.Forbidden, (await user.Http.GetAsync("/api/debug/crash")).StatusCode);
++        Assert.Equal("User", h.InDb(db => db.Users.Single(u => u.Id == user.Id).Role));
++        Assert.Equal("User", h.InDb(db => db.Users.Single(u => u.Id == victim.Id).Role));
++    }
++
++    [Fact]
++    [OwaspApi("API5")]
++    public async Task Nobody_can_mint_a_key_more_powerful_than_themselves_and_a_read_key_cannot_write()
++    {
++        var h = Start();
++        var user = h.NewPerson();
++        Assert.Equal(HttpStatusCode.Forbidden, (await user.Http.PostAsJsonAsync("/api/keys", new { name = "x", level = "admin" })).StatusCode);
++
++        var created = await user.Http.PostAsJsonAsync("/api/keys", new { name = "r", level = "read" });
++        var key = (await Json(created)).GetProperty("apiKey").GetString()!;
++        var write = new HttpRequestMessage(HttpMethod.Post, "/api/partner/blogs") { Content = JsonContent.Create(new { title = "t", body = "b" }) };
++        write.Headers.Add("X-Api-Key", key);
++        Assert.Equal(HttpStatusCode.Forbidden, (await h.Anonymous().SendAsync(write)).StatusCode);
++        Assert.Equal(0, h.InDb(db => db.Blogs.Count(b => b.AuthorId == user.Id)));
++    }
++
++    // ================= API6 Unrestricted Access to Sensitive Business Flows =================
++
++    [Fact]
++    [OwaspApi("API6")]
++    public async Task Mass_registration_from_one_address_is_throttled()
++    {
++        var h = Start(("RateLimiting__Login", "3"), ("RateLimiting__WindowSeconds", "600"));
++        var anon = h.Anonymous();
++        var statuses = new List<HttpStatusCode>();
++        for (var i = 0; i < 5; i++)
++        {
++            var n = "m" + Guid.NewGuid().ToString("N")[..10];
++            statuses.Add((await anon.PostAsJsonAsync("/api/auth/register", new { username = n, password = "correct-horse-battery", displayName = "M", email = $"{n}@example.com" })).StatusCode);
++        }
++        Assert.Equal(3, statuses.Count(s => s == HttpStatusCode.Created));
++        Assert.Equal(2, statuses.Count(s => s == HttpStatusCode.TooManyRequests));
++    }
++
++    // ================= API7 Server Side Request Forgery =================
++
++    [Theory]
++    [InlineData("http://example.com/")]                                    // not https
++    [InlineData("https://127.0.0.1/")]                                     // loopback literal
++    [InlineData("https://169.254.169.254/latest/meta-data/")]              // cloud metadata
++    [InlineData("https://[::1]/")]
++    [InlineData("https://example.com@evil.example/")]                     // user-info trick
++    [InlineData("https://evil.example/")]                                  // not on the allow-list
++    [InlineData("https://example.com.evil.example/")]                      // suffix trick
++    [InlineData("https://example.com:8443/")]                              // other port
++    [InlineData("file:///etc/passwd")]
++    [InlineData("gopher://example.com/")]
++    [InlineData("")]
++    [OwaspApi("API7")]
++    public async Task The_link_preview_refuses_urls_that_are_not_on_the_allow_list(string url)
++    {
++        var p = Start().NewPerson();
++        var res = await p.Http.PostAsJsonAsync("/api/tools/link-preview", new { url });
++        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);        // refused before any connection is made
++    }
++
++    // ================= API8 Security Misconfiguration =================
++
++    [Fact]
++    [OwaspApi("API8")]
++    public async Task Every_kind_of_response_carries_the_defensive_headers_and_no_server_banner()
++    {
++        var h = Start();
++        var (p, admin) = (h.NewPerson(), h.NewPerson("Admin"));
++        var responses = new[]
++        {
++            await p.Http.GetAsync("/api/me"),                                  // 200
++            await h.Anonymous().GetAsync("/api/me"),                           // 401
++            await p.Http.GetAsync("/api/admin/users"),                         // 403
++            await p.Http.GetAsync("/api/nope"),                                // 404
++            await admin.Http.GetAsync("/api/debug/crash"),                     // 500
++        };
++        foreach (var r in responses)
++        {
++            Assert.Equal("nosniff", string.Join(",", r.Headers.GetValues("X-Content-Type-Options")));
++            Assert.Contains("frame-ancestors 'none'", string.Join(",", r.Headers.GetValues("Content-Security-Policy")));
++            Assert.Contains("no-store", r.Headers.CacheControl?.ToString());
++            foreach (var banner in new[] { "Server", "X-Powered-By", "X-AspNet-Version" }) Assert.False(r.Headers.Contains(banner), banner);
++        }
++    }
++
++    [Theory]
++    [InlineData("https://evil.example", false)]
++    [InlineData("https://localhost:5173.evil.example", false)]
++    [InlineData("null", false)]
++    [InlineData("https://localhost:5173", true)]
++    [OwaspApi("API8")]
++    public async Task Cross_origin_access_is_granted_to_the_front_end_origin_only(string origin, bool allowed)
++    {
++        var h = Start();
++        var req = new HttpRequestMessage(HttpMethod.Options, "/api/blogs");
++        req.Headers.Add("Origin", origin); req.Headers.Add("Access-Control-Request-Method", "GET");
++        var res = await h.Anonymous().SendAsync(req);
++        Assert.Equal(allowed, res.Headers.Contains("Access-Control-Allow-Origin"));
++        if (allowed) Assert.Equal(origin, res.Headers.GetValues("Access-Control-Allow-Origin").Single());
++    }
++
++    [Fact]
++    [OwaspApi("API8")]
++    public async Task A_crash_tells_the_caller_nothing_about_the_inside()
++    {
++        var admin = Start().NewPerson("Admin");
++        var res = await admin.Http.GetAsync("/api/debug/crash");
++        var text = await res.Content.ReadAsStringAsync();
++        Assert.Equal(HttpStatusCode.InternalServerError, res.StatusCode);
++        foreach (var secret in new[] { "Boom", "Server=", "User Id", "InvalidOperationException", " at SecLab", "StackTrace" }) Assert.DoesNotContain(secret, text);
++    }
++
++    // ================= API9 Improper Inventory Management =================
++
++    [Fact]
++    [OwaspApi("API9")]
++    public async Task Old_versions_announce_their_retirement_and_unknown_versions_are_refused()
++    {
++        var p = Start().NewPerson();
++        var v1 = await p.Http.GetAsync("/api/blogs");                       // default = v1 = deprecated
++        Assert.True(v1.Headers.Contains("Deprecation"));
++        Assert.True(v1.Headers.Contains("api-supported-versions"));
++        Assert.Equal(HttpStatusCode.BadRequest, (await p.Http.GetAsync("/api/blogs?api-version=9.9")).StatusCode);
++        Assert.False((await p.Http.GetAsync("/api/blogs?api-version=2.0")).Headers.Contains("Deprecation"));
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/SecurityUnitTests.cs sol16/backend/tests/SecLab.Api.Tests/Learner/SecurityUnitTests.cs
+--- a/backend/tests/SecLab.Api.Tests/Learner/SecurityUnitTests.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/SecurityUnitTests.cs	2026-10-04 21:23:07.318465086 +0200
+@@ -0,0 +1,255 @@
++using System.ComponentModel.DataAnnotations;
++using System.Net;
++using System.Security.Claims;
++using System.Text;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.DataProtection;
++using Microsoft.AspNetCore.Http;
++using Microsoft.Extensions.Configuration;
++using SecLab.Api.Authorization;
++using SecLab.Api.Data;
++using SecLab.Api.Observability;
++using SecLab.Api.Security;
++using SecLab.Api.Validation;
++using Xunit;
++
++namespace SecLab.Api.Tests.Learner;
++
++// Step 16 - unit tests for the small security helpers: no host, no database, no network, milliseconds.
++// They are the target of the mutation test (backend/tests/SecLab.Api.Tests/stryker-config.json).
++[Trait("Step", "16")]
++[Trait("Kind", "Unit")]
++public class SecurityUnitTests
++{
++    // ---------- API key helpers ----------
++    [Fact]
++    public void Key_hash_is_a_deterministic_32_byte_digest_that_does_not_contain_the_secret()
++    {
++        var a = ApiKeyDefaults.Hash("s3cret-value");
++        Assert.Equal(32, a.Length);
++        Assert.Equal(a, ApiKeyDefaults.Hash("s3cret-value"));
++        Assert.NotEqual(a, ApiKeyDefaults.Hash("s3cret-valuf"));
++        Assert.NotEqual(a, ApiKeyDefaults.Hash("S3CRET-VALUE"));
++        Assert.DoesNotContain("s3cret", Convert.ToHexString(a), StringComparison.OrdinalIgnoreCase);
++        Assert.Equal("E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855", Convert.ToHexString(ApiKeyDefaults.Hash("")));   // known-answer test: SHA-256 of ""
++    }
++
++    [Theory]
++    [InlineData("read", 1)] [InlineData("write", 2)] [InlineData("admin", 3)]
++    [InlineData("READ", 0)] [InlineData("root", 0)] [InlineData("", 0)] [InlineData(null, 0)]
++    public void Levels_are_ordered_and_anything_unknown_has_no_rank(string? level, int rank) => Assert.Equal(rank, ApiKeyDefaults.Rank(level));
++
++    // ---------- outbound URL policy (SSRF) ----------
++    static readonly string[] Allowed = ["example.com"];
++
++    [Theory]
++    [InlineData("https://example.com/")]
++    [InlineData("https://example.com/a/b?c=d")]
++    [InlineData("https://EXAMPLE.com/")]
++    [InlineData("https://example.com:443/")]
++    public void Allow_listed_https_urls_are_accepted(string url)
++    {
++        Assert.True(OutboundUrlPolicy.TryValidate(url, Allowed, out var uri));
++        Assert.Equal("example.com", uri!.Host);
++    }
++
++    [Theory]
++    [InlineData(null)] [InlineData("")] [InlineData("   ")] [InlineData("not a url")] [InlineData("/relative/path")]
++    [InlineData("http://example.com/")] [InlineData("ftp://example.com/")] [InlineData("file:///etc/passwd")]
++    [InlineData("https://example.com@evil.example/")] [InlineData("https://user:pw@example.com/")]
++    [InlineData("https://example.com:8443/")] [InlineData("https://example.com:80/")]
++    [InlineData("https://127.0.0.1/")] [InlineData("https://[::1]/")] [InlineData("https://2130706433/")] [InlineData("https://0x7f.1/")]
++    [InlineData("https://evil.example/")] [InlineData("https://example.com.evil.example/")] [InlineData("https://notexample.com/")] [InlineData("https://sub.example.com/")]
++    public void Everything_else_is_refused_and_yields_no_uri(string? url)
++    {
++        Assert.False(OutboundUrlPolicy.TryValidate(url, Allowed, out var uri));
++        Assert.Null(uri);
++    }
++
++    [Fact]
++    public void The_length_limit_is_2048_characters_exactly_and_an_empty_allow_list_refuses_everything()
++    {
++        const string prefix = "https://example.com/";
++        Assert.True(OutboundUrlPolicy.TryValidate(prefix + new string('a', 2048 - prefix.Length), Allowed, out _));      // 2048: fine
++        Assert.False(OutboundUrlPolicy.TryValidate(prefix + new string('a', 2049 - prefix.Length), Allowed, out _));     // 2049: too long
++        Assert.False(OutboundUrlPolicy.TryValidate(prefix, [], out _));
++    }
++
++    [Theory]
++    [InlineData("8.8.8.8", true)] [InlineData("1.1.1.1", true)] [InlineData("93.184.216.34", true)] [InlineData("2606:4700:4700::1111", true)]
++    [InlineData("127.0.0.1", false)] [InlineData("127.255.255.254", false)] [InlineData("0.0.0.0", false)] [InlineData("255.255.255.255", false)]
++    [InlineData("10.0.0.1", false)] [InlineData("172.16.0.1", false)] [InlineData("172.31.255.255", false)] [InlineData("172.32.0.1", true)] [InlineData("172.15.0.1", true)]
++    [InlineData("192.168.1.1", false)] [InlineData("169.254.169.254", false)] [InlineData("100.64.0.1", false)] [InlineData("100.127.255.255", false)] [InlineData("100.128.0.1", true)]
++    [InlineData("224.0.0.1", false)] [InlineData("::1", false)] [InlineData("::", false)] [InlineData("fe80::1", false)] [InlineData("fc00::1", false)] [InlineData("ff02::1", false)]
++    [InlineData("::ffff:127.0.0.1", false)] [InlineData("::ffff:10.0.0.1", false)] [InlineData("::ffff:8.8.8.8", true)]
++    // each range must be tested from BOTH sides: the other octet alone must not be enough (mutation testing found these gaps)
++    [InlineData("192.0.2.1", true)] [InlineData("8.168.0.1", true)] [InlineData("169.1.1.1", true)] [InlineData("8.254.1.1", true)] [InlineData("172.20.0.1", false)] [InlineData("8.20.0.1", true)]
++    [InlineData("100.64.0.0", false)] [InlineData("100.63.255.255", true)] [InlineData("8.100.64.1", true)]
++    public void Only_public_addresses_are_public(string ip, bool isPublic) => Assert.Equal(isPublic, OutboundUrlPolicy.IsPublic(IPAddress.Parse(ip)));
++
++    // ---------- admin network ----------
++    static async Task<bool> AdminNetworkAllows(string? ip, params string[] networks)
++    {
++        var config = new ConfigurationBuilder().AddInMemoryCollection(networks.Select((n, i) => KeyValuePair.Create($"Admin:AllowedNetworks:{i}", (string?)n))).Build();
++        var requirement = new AdminNetworkRequirement();
++        var http = new DefaultHttpContext();
++        if (ip is not null) http.Connection.RemoteIpAddress = IPAddress.Parse(ip);
++        var ctx = new AuthorizationHandlerContext([requirement], new ClaimsPrincipal(), http);
++        await new AdminNetworkHandler(config).HandleAsync(ctx);
++        return ctx.HasSucceeded;
++    }
++
++    [Theory]
++    [InlineData("127.0.0.1", true)] [InlineData("::1", true)] [InlineData("::ffff:127.0.0.1", true)]
++    [InlineData("10.1.2.3", false)] [InlineData("128.0.0.1", false)] [InlineData("8.8.8.8", false)] [InlineData(null, false)]
++    public async Task The_admin_area_is_reachable_from_loopback_only_by_default(string? ip, bool expected) =>
++        Assert.Equal(expected, await AdminNetworkAllows(ip, "127.0.0.1/32", "::1/128"));
++
++    [Theory]
++    [InlineData("10.1.2.3", true)] [InlineData("10.255.255.255", true)] [InlineData("11.0.0.1", false)] [InlineData("9.255.255.255", false)]
++    public async Task Cidr_ranges_are_honoured(string ip, bool expected) => Assert.Equal(expected, await AdminNetworkAllows(ip, "10.0.0.0/8"));
++
++    [Fact]
++    public async Task With_no_network_configured_nobody_is_let_in() => Assert.False(await AdminNetworkAllows("127.0.0.1"));
++
++    // ---------- log hygiene ----------
++    [Theory]
++    [InlineData(null, "")] [InlineData("", "")] [InlineData("alice", "alice")]
++    [InlineData("a\r\nAudit login.succeeded: user admin", "aAudit login.succeeded: user admin")]    // no forged second log line
++    [InlineData("tab\there", "tabhere")] [InlineData("esc\u001b[31mred", "esc[31mred")] [InlineData("nul\0byte", "nulbyte")]
++    public void Text_typed_by_a_user_cannot_forge_log_lines(string? input, string expected) => Assert.Equal(expected, AuditLog.Clean(input));
++
++    [Fact]
++    public void Logged_text_is_cut_to_the_requested_length()
++    {
++        Assert.Equal(64, AuditLog.Clean(new string('x', 500)).Length);
++        Assert.Equal("abc", AuditLog.Clean("abcdef", max: 3));
++        Assert.Equal("ab", AuditLog.Clean("a\nb\nc", max: 2));      // control characters do not count against the budget
++    }
++
++    // ---------- HTML sanitizer (stored XSS) ----------
++    readonly ContentSanitizer _sanitizer = new();
++
++    [Theory]
++    [InlineData("<script>alert(1)</script>")] [InlineData("<img src=x onerror=alert(1)>")] [InlineData("<a href=\"javascript:alert(1)\">x</a>")]
++    [InlineData("<svg onload=alert(1)>")] [InlineData("<iframe src=\"https://evil.example\"></iframe>")] [InlineData("<p style=\"background:url(javascript:alert(1))\">x</p>")]
++    [InlineData("<a href=\"data:text/html;base64,PHNjcmlwdD4=\">x</a>")] [InlineData("<p onclick=\"alert(1)\">x</p>")]
++    public void Active_content_is_removed(string html)
++    {
++        var clean = _sanitizer.Clean(html);
++        foreach (var bad in new[] { "<script", "onerror", "onload", "onclick", "javascript:", "<iframe", "<svg", "<img", "style=", "data:" }) Assert.DoesNotContain(bad, clean, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Theory]
++    [InlineData("<p>x</p>", "<p>")] [InlineData("a<br>b", "<br>")] [InlineData("<b>x</b>", "<b>")] [InlineData("<i>x</i>", "<i>")] [InlineData("<u>x</u>", "<u>")]
++    [InlineData("<strong>x</strong>", "<strong>")] [InlineData("<em>x</em>", "<em>")] [InlineData("<ul><li>x</li></ul>", "<ul><li>")] [InlineData("<ol><li>x</li></ol>", "<ol><li>")]
++    [InlineData("<code>x</code>", "<code>")] [InlineData("<pre>x</pre>", "<pre>")] [InlineData("<blockquote>x</blockquote>", "<blockquote>")]
++    [InlineData("<h1>x</h1>", "<h1>")] [InlineData("<h2>x</h2>", "<h2>")] [InlineData("<h3>x</h3>", "<h3>")] [InlineData("<h4>x</h4>", "<h4>")]
++    public void Every_tag_on_the_allow_list_survives(string html, string expected) => Assert.Contains(expected, _sanitizer.Clean(html));
++
++    [Theory]
++    [InlineData("https://example.com/", true)] [InlineData("http://example.com/", true)] [InlineData("mailto:a@example.com", true)]
++    [InlineData("ftp://example.com/", false)] [InlineData("tel:+4790000000", false)] [InlineData("javascript:alert(1)", false)] [InlineData("vbscript:msgbox(1)", false)]
++    [InlineData("data:text/html,x", false)] [InlineData("sms:123", false)]
++    public void Only_http_https_and_mailto_links_survive(string href, bool kept) =>
++        Assert.Equal(kept, _sanitizer.Clean($"<a href=\"{href}\">x</a>").Contains("href=", StringComparison.Ordinal));
++
++    [Theory]
++    [InlineData("<div>x</div>")] [InlineData("<span>x</span>")] [InlineData("<form action=\"/x\">x</form>")] [InlineData("<table><tr><td>x</td></tr></table>")] [InlineData("<object data=\"x\"></object>")]
++    public void Tags_that_are_not_on_the_allow_list_are_removed_together_with_their_content(string html) =>
++        Assert.DoesNotContain("<", _sanitizer.Clean(html));        // (the library drops the element; whether it should keep the text is a product decision, not a security one)
++
++    [Fact]
++    public void Plain_formatting_survives_and_links_cannot_reach_back_into_the_page()
++    {
++        Assert.Equal("<p>Hello <b>world</b></p>", _sanitizer.Clean("<p>Hello <b>world</b></p>"));
++        var link = _sanitizer.Clean("<a href=\"https://example.com/x\" target=\"_blank\">go</a>");
++        Assert.Contains("href=\"https://example.com/x\"", link);
++        Assert.Contains("noopener", link);
++        Assert.Contains("nofollow", link);
++        Assert.DoesNotContain("target", link);
++    }
++
++    // ---------- request validation (data annotations on the contract types) ----------
++    static List<ValidationResult> Validate(object o)
++    {
++        var results = new List<ValidationResult>();
++        Validator.TryValidateObject(o, new ValidationContext(o), results, validateAllProperties: true);
++        return results;
++    }
++    static string[] Failing(object o) => Validate(o).SelectMany(r => r.MemberNames).Order().ToArray();
++
++    [Fact]
++    public void A_valid_registration_has_no_violations() =>
++        Assert.Empty(Validate(new RegisterRequest("alice_01", "correct-horse-battery", "Alice", "alice@example.com")));
++
++    [Theory]
++    [InlineData("ab")] [InlineData("a b c")] [InlineData("alice<script>")] [InlineData("åse")] [InlineData("")] [InlineData(null)]
++    public void Usernames_are_ascii_words_of_3_to_32_characters(string? username) =>
++        Assert.Contains("Username", Failing(new RegisterRequest(username, "correct-horse-battery", "A", "a@example.com")));
++
++    [Theory]
++    [InlineData("short")] [InlineData("12345678901")] [InlineData(null)]
++    public void Passwords_need_at_least_12_characters(string? password) =>
++        Assert.Contains("Password", Failing(new RegisterRequest("alice", password, "A", "a@example.com")));
++
++    [Fact]
++    public void Passwords_are_capped_so_hashing_cannot_be_used_to_burn_cpu() =>
++        Assert.Contains("Password", Failing(new RegisterRequest("alice", new string('p', 129), "A", "a@example.com")));
++
++    [Theory]
++    [InlineData("<b>x</b>")] [InlineData("a<b")] [InlineData("")]
++    public void Names_and_titles_are_text_never_markup(string value)
++    {
++        Assert.Contains("DisplayName", Failing(new RegisterRequest("alice", "correct-horse-battery", value, "a@example.com")));
++        Assert.Contains("Title", Failing(new CreateBlog(value, "body")));
++    }
++
++    [Theory]
++    [InlineData("+47 900 00 000", true)] [InlineData("(555) 123-4567", true)] [InlineData("123456", true)]
++    [InlineData("12345", false)] [InlineData("+47 900 00 000 000 000 000", false)] [InlineData("call me", false)] [InlineData("'; DROP TABLE Users;--", false)] [InlineData("<script>", false)]
++    public void Phone_numbers_follow_the_allow_listed_format(string phone, bool valid) =>
++        Assert.Equal(valid, !Failing(new UpdateProfile(null, null, phone, null, null)).Contains("Phone"));
++
++    [Theory]
++    [InlineData("a@b.no", true)] [InlineData("a@b", false)] [InlineData("a b@c.no", false)] [InlineData("<a@b.no>", false)] [InlineData("a@@b.no", false)]
++    public void E_mail_addresses_have_a_basic_shape(string email, bool valid) =>
++        Assert.Equal(valid, !Failing(new UpdateProfile(null, email, null, null, null)).Contains("Email"));
++
++    [Fact]
++    public void Blog_limits_are_enforced_at_the_boundary()
++    {
++        Assert.Empty(Validate(new CreateBlog(new string('t', 120), new string('b', 10_000))));
++        Assert.Equal(["Body", "Title"], Failing(new CreateBlog(new string('t', 121), new string('b', 10_001))));
++        Assert.Equal(["Body", "Title"], Failing(new CreateBlog(null, null)));
++    }
++
++    // ---------- column encryption ----------
++    static EncryptedStringConverter Converter(IDataProtectionProvider p, string purpose = "SecLab.Users.PersonalData.v1") => new(p.CreateProtector(purpose));
++    static string Protect(EncryptedStringConverter c, string plain) => (string)c.ConvertToProvider(plain)!;
++    static string Unprotect(EncryptedStringConverter c, string stored) => (string)c.ConvertFromProvider(stored)!;
++
++    [Fact]
++    public void Encrypted_values_round_trip_but_do_not_contain_the_plaintext_and_differ_every_time()
++    {
++        var c = Converter(new EphemeralDataProtectionProvider());
++        var a = Protect(c, "+47 900 00 000"); var b = Protect(c, "+47 900 00 000");
++        Assert.NotEqual(a, b);                                  // randomised: equal plaintexts are not visible as equal
++        Assert.DoesNotContain("900", a);
++        Assert.True(a.Length > "+47 900 00 000".Length * 2);
++        Assert.Equal("+47 900 00 000", Unprotect(c, a));
++        Assert.Equal("", Unprotect(c, Protect(c, "")));
++    }
++
++    [Fact]
++    public void Ciphertext_cannot_be_opened_with_another_purpose_another_key_ring_or_after_tampering()
++    {
++        var ring = new EphemeralDataProtectionProvider();
++        var stored = Protect(Converter(ring), "secret address");
++        Assert.ThrowsAny<System.Security.Cryptography.CryptographicException>(() => Unprotect(Converter(ring, "SecLab.Something.Else"), stored));
++        Assert.ThrowsAny<System.Security.Cryptography.CryptographicException>(() => Unprotect(Converter(new EphemeralDataProtectionProvider()), stored));
++        var tampered = stored[..^4] + (stored.EndsWith("AAAA") ? "BBBB" : "AAAA");
++        Assert.ThrowsAny<System.Security.Cryptography.CryptographicException>(() => Unprotect(Converter(ring), tampered));
++        Assert.ThrowsAny<Exception>(() => Unprotect(Converter(ring), "plaintext that was never encrypted"));
++    }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/admin-users.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/admin-users.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/admin-users.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/admin-users.json	2026-10-04 21:18:16.778775182 +0200
+@@ -0,0 +1,9 @@
++{
++  "$": "array",
++  "$[]": "object",
++  "$[].displayName": "string",
++  "$[].email": "string",
++  "$[].id": "number",
++  "$[].role": "string",
++  "$[].username": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blog-created.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blog-created.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blog-created.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blog-created.json	2026-10-04 21:18:16.777849331 +0200
+@@ -0,0 +1,7 @@
++{
++  "$": "object",
++  "$.body": "string",
++  "$.createdAt": "string",
++  "$.id": "number",
++  "$.title": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blogs-v1.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blogs-v1.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blogs-v1.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blogs-v1.json	2026-10-04 21:18:16.776776097 +0200
+@@ -0,0 +1,12 @@
++{
++  "$": "array",
++  "$[]": "object",
++  "$[].authorAvatar": "string",
++  "$[].authorId": "number",
++  "$[].authorName": "string",
++  "$[].body": "string",
++  "$[].createdAt": "string",
++  "$[].id": "number",
++  "$[].likes": "number",
++  "$[].title": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blogs-v2.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blogs-v2.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blogs-v2.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/blogs-v2.json	2026-10-04 21:18:16.777829418 +0200
+@@ -0,0 +1,16 @@
++{
++  "$": "object",
++  "$.items": "array",
++  "$.items[]": "object",
++  "$.items[].authorAvatar": "string",
++  "$.items[].authorId": "number",
++  "$.items[].authorName": "string",
++  "$.items[].body": "string",
++  "$.items[].createdAt": "string",
++  "$.items[].id": "number",
++  "$.items[].likes": "number",
++  "$.items[].title": "string",
++  "$.page": "number",
++  "$.pageSize": "number",
++  "$.total": "number"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/friends.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/friends.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/friends.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/friends.json	2026-10-04 21:18:16.776691888 +0200
+@@ -0,0 +1,11 @@
++{
++  "$": "array",
++  "$[]": "object",
++  "$[].avatarUrl": "string",
++  "$[].bio": "string",
++  "$[].displayName": "string",
++  "$[].email": "string",
++  "$[].id": "number",
++  "$[].phone": "string",
++  "$[].username": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/key-created.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/key-created.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/key-created.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/key-created.json	2026-10-04 21:18:16.778795156 +0200
+@@ -0,0 +1,8 @@
++{
++  "$": "object",
++  "$.apiKey": "string",
++  "$.expiresAt": "null",
++  "$.id": "number",
++  "$.level": "string",
++  "$.prefix": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/keys-list.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/keys-list.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/keys-list.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/keys-list.json	2026-10-04 21:18:16.778820619 +0200
+@@ -0,0 +1,12 @@
++{
++  "$": "array",
++  "$[]": "object",
++  "$[].createdAt": "string",
++  "$[].expiresAt": "null",
++  "$[].id": "number",
++  "$[].lastUsedAt": "null",
++  "$[].level": "string",
++  "$[].name": "string",
++  "$[].prefix": "string",
++  "$[].revokedAt": "null"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/login.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/login.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/login.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/login.json	2026-10-04 21:18:16.776549496 +0200
+@@ -0,0 +1,14 @@
++{
++  "$": "object",
++  "$.token": "string",
++  "$.user": "object",
++  "$.user.address": "string",
++  "$.user.avatarUrl": "string",
++  "$.user.bio": "string",
++  "$.user.displayName": "string",
++  "$.user.email": "string",
++  "$.user.id": "number",
++  "$.user.phone": "string",
++  "$.user.role": "string",
++  "$.user.username": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/me.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/me.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/me.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/me.json	2026-10-04 21:18:16.776589204 +0200
+@@ -0,0 +1,12 @@
++{
++  "$": "object",
++  "$.address": "string",
++  "$.avatarUrl": "string",
++  "$.bio": "string",
++  "$.displayName": "string",
++  "$.email": "string",
++  "$.id": "number",
++  "$.phone": "string",
++  "$.role": "string",
++  "$.username": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/register.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/register.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/register.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/register.json	2026-10-04 21:18:16.775776271 +0200
+@@ -0,0 +1,5 @@
++{
++  "$": "object",
++  "$.id": "number",
++  "$.username": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/timeline.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/timeline.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/timeline.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/timeline.json	2026-10-04 21:18:16.777875235 +0200
+@@ -0,0 +1,12 @@
++{
++  "$": "array",
++  "$[]": "object",
++  "$[].authorAvatar": "string",
++  "$[].authorId": "number",
++  "$[].authorName": "string",
++  "$[].body": "string",
++  "$[].createdAt": "string",
++  "$[].id": "number",
++  "$[].likes": "number",
++  "$[].title": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-friend-view.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-friend-view.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-friend-view.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-friend-view.json	2026-10-04 21:18:16.776647182 +0200
+@@ -0,0 +1,10 @@
++{
++  "$": "object",
++  "$.avatarUrl": "string",
++  "$.bio": "string",
++  "$.displayName": "string",
++  "$.email": "string",
++  "$.id": "number",
++  "$.phone": "string",
++  "$.username": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-owner-view.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-owner-view.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-owner-view.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-owner-view.json	2026-10-04 21:18:16.776623842 +0200
+@@ -0,0 +1,12 @@
++{
++  "$": "object",
++  "$.address": "string",
++  "$.avatarUrl": "string",
++  "$.bio": "string",
++  "$.displayName": "string",
++  "$.email": "string",
++  "$.id": "number",
++  "$.phone": "string",
++  "$.role": "string",
++  "$.username": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-public-view.json sol16/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-public-view.json
+--- a/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-public-view.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/Learner/Snapshots/user-public-view.json	2026-10-04 21:18:16.776664902 +0200
+@@ -0,0 +1,8 @@
++{
++  "$": "object",
++  "$.avatarUrl": "string",
++  "$.bio": "string",
++  "$.displayName": "string",
++  "$.id": "number",
++  "$.username": "string"
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/backend/tests/SecLab.Api.Tests/stryker-config.json sol16/backend/tests/SecLab.Api.Tests/stryker-config.json
+--- a/backend/tests/SecLab.Api.Tests/stryker-config.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Api.Tests/stryker-config.json	2026-10-04 21:33:24.024723964 +0200
+@@ -0,0 +1,16 @@
++{
++  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-net/master/src/Stryker.Core/Stryker.Core/stryker-config.schema.json",
++  "stryker-config": {
++    "project": "SecLab.Api.csproj",
++    "test-case-filter": "Kind=Unit",
++    "mutate": [
++      "**/Security/OutboundUrlPolicy.cs{1..35}",
++      "**/Security/AdminNetwork.cs",
++      "**/Validation/ContentSanitizer.cs",
++      "**/Data/ColumnEncryption.cs"
++    ],
++    "thresholds": { "high": 95, "low": 90, "break": 90 },
++    "reporters": ["progress", "html", "json"],
++    "mutation-level": "Standard"
++  }
++}
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/docs/00-overview-and-threat-model.md sol16/docs/00-overview-and-threat-model.md
+--- a/docs/00-overview-and-threat-model.md	2026-09-30 11:05:09.347318464 +0200
++++ b/docs/00-overview-and-threat-model.md	2026-10-04 21:33:52.517957828 +0200
+@@ -24,6 +24,7 @@
+ | W13 | No versioning | all routes | 08 |
+ | W14 | DB accessed as `sa` with a weak committed password | `appsettings.json`, `docker-compose.yml` | 15 |
+ | W15 | Token in `localStorage` | frontend | 03 |
++| W16 | "Check, then insert" races: duplicate usernames, `500` on a concurrent duplicate like (not listed in the starter; found by step 16's concurrency tests) | `POST /api/auth/register`, `POST /api/blogs/{id}/like`, `Users` table | 16 |
+ 
+ ## Try the baseline attacks
+ Scripts in `docs/attack-scripts/` (need the API running on :5080):
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/docs/owasp-matrix.md sol16/docs/owasp-matrix.md
+--- a/docs/owasp-matrix.md	2026-10-04 21:32:20.561762000 +0200
++++ b/docs/owasp-matrix.md	2026-10-04 21:33:52.517929755 +0200
+@@ -16,10 +16,10 @@
+ |----|-------|-----------------------|------------|----------|--------|
+ | A01 | Broken Access Control | Object/function access in `/api/users/{id}`, blogs, admin routes; SSRF via link preview | Step 05 default-deny, resource handlers, DTOs per audience; step 09 allow-lists incl. SSRF policy; step 06 key levels | Step=05, Step=09 | Mitigated |
+ | A02 | Security Misconfiguration | Dev exception page, open CORS, `*` hosts, verbose headers, dev-mode Keycloak/SQL, weak `sa` password in compose | Steps 01, 09, 11, 13 (headers, CSP); step 15: secrets from `.env`, least-privilege SQL logins, TLS to the database. Left: dev-mode Keycloak with `admin/admin`, lab certificate, secrets in a file instead of a vault (Part 2) | Step=15 | Partial |
+-| A03 | Software Supply Chain Failures | NuGet and npm dependencies, container images, CI actions | Step 13: NuGet audit as build errors, lock files, unused package removed; `npm audit`; Part 2 pins actions and scans images | Step=13 | Partial |
++| A03 | Software Supply Chain Failures | NuGet and npm dependencies, container images, CI actions | Step 13: NuGet audit as build errors, lock files, unused package removed; `npm audit`; step 16: the test project is locked and audited too (`16-supply-chain.sh`, checked by `Step16TestingTests`); Part 2 pins actions and scans images | Step=13, Step=16 | Partial |
+ | A04 | Cryptographic Failures | Passwords at rest, TLS in transit, API-key digests, DB columns holding phone/address | Step 01 TLS 1.2+, HSTS; step 02 PBKDF2 hashing; step 06 hashed keys; step 15 verified TLS to SQL Server and encrypted phone/address columns. Left: the Data Protection key ring is an unprotected file (vault/HSM in Part 2), no Always Encrypted | Step=15 | Partial |
+ | A05 | Injection | `/api/blogs/search` built SQL by concatenation (fixed); HTML in blog bodies (XSS) | Step 10 validation + HTML sanitising; step 15 parameterised search, EF1002/EF1003 build errors, app login without DDL rights (blast radius) | Step=15 | Mitigated |
+-| A06 | Insecure Design | Trust assumptions: client-chosen identity, unlimited friends/likes, no abuse limits, unversioned API | Steps 03/05 (identity from tokens), 07 rate limits, 08 versioning and retirement, 04 step-up for destructive actions | Step=04 | Mitigated |
++| A06 | Insecure Design | Trust assumptions: client-chosen identity, unlimited friends/likes, no abuse limits, unversioned API | Steps 03/05 (identity from tokens), 07 rate limits, 08 versioning and retirement, 04 step-up for destructive actions; step 16: "check, then insert" races closed by a unique index on `Users.Username` and idempotent likes (found by concurrency tests) | Step=04, Step=16 | Mitigated |
+ | A07 | Authentication Failures | Login, registration, API keys, tokens, WebAuthn | Step 02 hashing/lockout/uniform failures, step 03 OIDC + PKCE, step 04 passkeys, step 06 keys, step 07 throttling | Step=03 | Mitigated |
+ | A08 | Software or Data Integrity Failures | Blog HTML from users, JWT signature validation, dependency and CI artefacts | Step 03 signature/issuer/audience validation, step 10 sanitising, step 13 lock files; signed images and pipeline integrity in Part 2 | Step=03 | Partial |
+ | A09 | Security Logging and Alerting Failures | Login, key, admin and denial events; alerting on abuse | Step 12 audit events, metrics, correlation and the detection exercise; central storage and alert rules in Part 2 | Step=12 | Partial |
+@@ -29,13 +29,13 @@
+ 
+ | ID | Title | Where / how in SecLab | Mitigation | Evidence | Status |
+ |----|-------|-----------------------|------------|----------|--------|
+-| API1 | Broken Object Level Authorization | Any endpoint taking a user or blog id: profile, friends, likes, blogs, keys | Step 05 loads then authorises every object; tests create their own users and try cross-access | Step=05 | Mitigated |
++| API1 | Broken Object Level Authorization | Any endpoint taking a user or blog id: profile, friends, likes, blogs, keys | Step 05 loads then authorises every object; tests create their own users and try cross-access; step 16: authorization matrix (every route x caller) and negative tests, guarded by mutants | Step=05, Step=16 | Mitigated |
+ | API2 | Broken Authentication | `/api/auth/*`, bearer validation, API keys, passkeys | Steps 02, 03, 04, 06 | Step=03 | Mitigated |
+ | API3 | Broken Object Property Level Authorization | `GET/PUT /api/users/{id}` returned and accepted whole entities incl. role and password | Step 05 three response shapes and an input DTO; step 10 constraints | Step=05 | Mitigated |
+ | API4 | Unrestricted Resource Consumption | Unbounded `/api/blogs`, uploads, request bodies, login floods | Step 07 rate limits, step 08 bounded pages (v2), step 09 upload and body caps, step 10 length limits | Step=07 | Mitigated |
+-| API5 | Broken Function Level Authorization | `/api/admin/*`, `/api/debug/*`, partner routes with key levels | Step 05 Admin policy, step 06 levels, step 09 admin network requirement | Step=06 | Mitigated |
++| API5 | Broken Function Level Authorization | `/api/admin/*`, `/api/debug/*`, partner routes with key levels | Step 05 Admin policy, step 06 levels, step 09 admin network requirement; step 16: the matrix fails when a route is unclassified or the Admin policy stops working | Step=06, Step=16 | Mitigated |
+ | API6 | Unrestricted Access to Sensitive Business Flows | Registration and login abuse (mass account creation, credential stuffing), like/blog spam | Step 07 per-IP limits and lockout, step 12 detection; no CAPTCHA or per-user post quotas yet | Step=07 | Partial |
+ | API7 | Server Side Request Forgery | `POST /api/tools/link-preview` fetches user-chosen URLs | Step 09: https-only exact host allow-list, no redirects, connect-time address check, size and time caps | Step=09 | Mitigated |
+ | API8 | Security Misconfiguration | CORS, headers, error pages, dev tooling, server banner | Steps 01, 09, 11, 13 | Step=13 | Mitigated |
+-| API9 | Improper Inventory Management | Deprecated v1, debug routes, health endpoints, undocumented routes | Step 08 versions with sunset and 410; step 13 test lists every anonymous endpoint and requires all `/api` routes to be in the version set | Step=13 | Mitigated |
+-| API10 | Unsafe Consumption of APIs | Link-preview responses and the ExternalApi service consumed by the API | Step 09 treats fetched content as untrusted text with size limits; consumer contracts and resilience follow in step 16 | Step=09 | Partial |
++| API9 | Improper Inventory Management | Deprecated v1, debug routes, health endpoints, undocumented routes | Step 08 versions with sunset and 410; step 13 test lists every anonymous endpoint and requires all `/api` routes to be in the version set; step 16: the authorization matrix also fails for any route that is not in its table | Step=13, Step=16 | Mitigated |
++| API10 | Unsafe Consumption of APIs | Link-preview responses and the ExternalApi service consumed by the API | Step 09 treats fetched content as untrusted text with size limits; consumer-side contract tests for outbound calls were not added in step 16 (the connect-time address check refuses a local fake upstream; see its solution notes) | Step=09 | Partial |
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/dotnet-tools.json sol16/dotnet-tools.json
+--- a/dotnet-tools.json	2026-10-04 21:32:20.561808437 +0200
++++ b/dotnet-tools.json	2026-10-04 21:33:24.025228257 +0200
+@@ -8,6 +8,13 @@
+         "dotnet-ef"
+       ],
+       "rollForward": false
++    },
++    "dotnet-stryker": {
++      "version": "5.0.0",
++      "commands": [
++        "dotnet-stryker"
++      ],
++      "rollForward": false
+     }
+   }
+ }
+\ No newline at end of file
+diff --color --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' -x .env mid16/.gitignore sol16/.gitignore
+--- a/.gitignore	2026-09-30 12:38:43.858520460 +0200
++++ b/.gitignore	2026-10-04 21:33:24.025228257 +0200
+@@ -10,3 +10,4 @@
+ !backend/src/SecLab.Api/wwwroot/avatars/.gitkeep
+ certs/
+ .env
++StrykerOutput/

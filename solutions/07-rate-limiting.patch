@@ -1,0 +1,213 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid07/backend/src/SecLab.Api/appsettings.Development.json sol07/backend/src/SecLab.Api/appsettings.Development.json
+--- a/backend/src/SecLab.Api/appsettings.Development.json	2026-09-30 11:22:11.069161413 +0200
++++ b/backend/src/SecLab.Api/appsettings.Development.json	2026-09-30 11:26:45.088141566 +0200
+@@ -1,5 +1,13 @@
+ {
+   "Auth": {
+     "Authority": "http://localhost:8081/realms/seclab"
++  },
++  "RateLimiting": {
++    "Anonymous": 1000,
++    "User": 1000,
++    "Login": 100,
++    "ApiKeyRead": 1000,
++    "ApiKeyWrite": 1000,
++    "ApiKeyAdmin": 1000
+   }
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid07/backend/src/SecLab.Api/appsettings.json sol07/backend/src/SecLab.Api/appsettings.json
+--- a/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:22:11.069170901 +0200
++++ b/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:26:45.088134242 +0200
+@@ -11,6 +11,18 @@
+     "RpName": "SecLab",
+     "Origins": [ "https://localhost:5173" ]
+   },
++  "RateLimiting": {
++    "WindowSeconds": 60,
++    "Anonymous": 20,
++    "User": 120,
++    "Login": 5,
++    "ApiKeyRead": 60,
++    "ApiKeyWrite": 300,
++    "ApiKeyAdmin": 1000
++  },
++  "Proxy": {
++    "KnownProxies": []
++  },
+   "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } },
+   "AllowedHosts": "*"
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid07/backend/src/SecLab.Api/Endpoints/Api.cs sol07/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:22:11.086337912 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:26:45.088116740 +0200
+@@ -7,6 +7,7 @@
+ using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Caching.Memory;
+ using SecLab.Api.Authorization;
++using Microsoft.AspNetCore.RateLimiting;
+ using SecLab.Api.Data;
+ using SecLab.Api.Models;
+ 
+@@ -27,7 +28,7 @@
+     public static void Map(WebApplication app)
+     {
+         var api = app.MapGroup("/api");                                // authenticated by default: see the fallback policy in Program.cs
+-        var auth = api.MapGroup("/auth").AllowAnonymous();            // legacy local login/registration stay public for now
++        var auth = api.MapGroup("/auth").AllowAnonymous().RequireRateLimiting(RateLimiting.RateLimiting.LoginPolicy);            // legacy local login/registration stay public for now
+ 
+         // ---- Auth ----
+         auth.MapPost("/register", async (RegisterRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid07/backend/src/SecLab.Api/Program.cs sol07/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 11:22:11.086261420 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 11:27:28.077938592 +0200
+@@ -4,6 +4,7 @@
+ using Microsoft.AspNetCore.Authentication.JwtBearer;
+ using Microsoft.AspNetCore.Authorization;
+ using SecLab.Api.Authorization;
++using SecLab.Api.RateLimiting;
+ using Microsoft.AspNetCore.Identity;
+ using SecLab.Api.Endpoints;
+ using SecLab.Api.Models;
+@@ -32,6 +33,7 @@
+ builder.Services.AddScoped<IAuthorizationHandler, UserResourceHandler>();
+ builder.Services.AddScoped<IAuthorizationHandler, BlogResourceHandler>();
+ builder.Services.AddMemoryCache();
++builder.Services.AddSecLabRateLimiting(builder.Configuration);
+ builder.Services.AddFido2(o =>
+ {
+     o.ServerDomain = builder.Configuration["WebAuthn:RpId"]!;                        // the relying-party id: a registrable domain, no scheme/port
+@@ -48,11 +50,14 @@
+ var app = builder.Build();
+ 
+ // WEAKNESS: developer exception page always on (leaks stack traces), plain HTTP only.
++app.UseSecLabForwardedHeaders(app.Configuration);   // first: everything after sees the trusted client address/scheme (only if proxies are configured)
+ app.UseDeveloperExceptionPage();
+ if (!app.Environment.IsDevelopment()) app.UseHsts();   // browsers remember: HTTPS only (skipped on localhost by design)
+ app.UseHttpsRedirection();
+ app.UseCors();
+ app.UseAuthentication();
++app.UseApiKeyPreAuthentication();
++app.UseRateLimiter();                      // after authentication: the limiter needs to know who is calling
+ app.UseAuthorization();
+ app.UseStaticFiles();
+ 
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid07/backend/src/SecLab.Api/RateLimiting/RateLimiting.cs sol07/backend/src/SecLab.Api/RateLimiting/RateLimiting.cs
+--- a/backend/src/SecLab.Api/RateLimiting/RateLimiting.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/RateLimiting/RateLimiting.cs	2026-09-30 11:27:28.077878339 +0200
+@@ -0,0 +1,102 @@
++using System.Net;
++using System.Security.Claims;
++using System.Threading.RateLimiting;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.AspNetCore.HttpOverrides;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.RateLimiting;
++using SecLab.Api.Authorization;
++
++namespace SecLab.Api.RateLimiting;
++
++/// <summary>Requests per window. Bound from the "RateLimiting" configuration section (env: RateLimiting__Anonymous=5).</summary>
++public class RateLimitSettings
++{
++    public int WindowSeconds { get; set; } = 60;
++    public int Anonymous { get; set; } = 20;      // per client IP
++    public int User { get; set; } = 120;          // per signed-in user
++    public int Login { get; set; } = 5;           // per client IP, login + registration
++    public int ApiKeyRead { get; set; } = 60;     // per key
++    public int ApiKeyWrite { get; set; } = 300;
++    public int ApiKeyAdmin { get; set; } = 1000;
++}
++
++public static class RateLimiting
++{
++    public const string LoginPolicy = "login";
++    const string ApiKeyItem = "seclab.apikey.principal";
++
++    static FixedWindowRateLimiterOptions Window(int permits, RateLimitSettings s) => new()
++    {
++        PermitLimit = permits, Window = TimeSpan.FromSeconds(s.WindowSeconds), QueueLimit = 0, AutoReplenishment = true,
++    };
++
++    static string ClientIp(HttpContext ctx) => ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";   // after UseForwardedHeaders: the *trusted* view of the client
++
++    public static IServiceCollection AddSecLabRateLimiting(this IServiceCollection services, IConfiguration config)
++    {
++        var s = config.GetSection("RateLimiting").Get<RateLimitSettings>() ?? new();
++
++        services.AddRateLimiter(o =>
++        {
++            o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
++
++            // Every request is counted in exactly one bucket, chosen by *who* is calling.
++            o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
++            {
++                if (ctx.Items[ApiKeyItem] is ClaimsPrincipal key)
++                {
++                    var limit = key.FindFirst(ApiKeyDefaults.LevelClaim)?.Value switch { "admin" => s.ApiKeyAdmin, "write" => s.ApiKeyWrite, _ => s.ApiKeyRead };
++                    return RateLimitPartition.GetFixedWindowLimiter("key:" + key.FindFirst("api_key_id")?.Value, _ => Window(limit, s));
++                }
++                if (ctx.User.Identity?.IsAuthenticated == true)
++                    return RateLimitPartition.GetFixedWindowLimiter("user:" + (ctx.User.FindFirst(LocalUserClaims.LocalUserId)?.Value ?? ctx.User.FindFirst("sub")?.Value),
++                        _ => Window(s.User, s));
++                return RateLimitPartition.GetFixedWindowLimiter("ip:" + ClientIp(ctx), _ => Window(s.Anonymous, s));   // also bad/unknown API keys
++            });
++
++            // Extra, much stricter bucket for credential endpoints: counts per IP whatever username is tried.
++            o.AddPolicy(LoginPolicy, ctx => RateLimitPartition.GetFixedWindowLimiter("login:" + ClientIp(ctx), _ => Window(s.Login, s)));
++
++            o.OnRejected = async (context, ct) =>
++            {
++                var http = context.HttpContext;
++                var retryAfter = context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var ra) ? (int)Math.Ceiling(ra.TotalSeconds) : s.WindowSeconds;
++                http.Response.StatusCode = StatusCodes.Status429TooManyRequests;
++                http.Response.Headers.RetryAfter = Math.Max(1, retryAfter).ToString();
++                await http.Response.WriteAsJsonAsync(new ProblemDetails
++                {
++                    Status = 429, Title = "Too many requests", Detail = $"Try again in {Math.Max(1, retryAfter)} seconds.",
++                }, options: null, contentType: "application/problem+json", cancellationToken: ct);
++            };
++        });
++
++        // Trust X-Forwarded-* ONLY from proxies we list.
++        // CAREFUL: with both KnownProxies and KnownNetworks empty the middleware trusts EVERY sender, so it is only enabled
++        // (see UseSecLabForwardedHeaders) when at least one proxy is configured. No proxy configured = headers ignored.
++        services.Configure<ForwardedHeadersOptions>(o =>
++        {
++            o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
++            o.ForwardLimit = 1;
++            o.KnownNetworks.Clear(); o.KnownProxies.Clear();
++            foreach (var ip in config.GetSection("Proxy:KnownProxies").Get<string[]>() ?? []) o.KnownProxies.Add(IPAddress.Parse(ip));
++        });
++        return services;
++    }
++
++    public static IApplicationBuilder UseSecLabForwardedHeaders(this IApplicationBuilder app, IConfiguration config) =>
++        (config.GetSection("Proxy:KnownProxies").Get<string[]>() ?? []).Length > 0 ? app.UseForwardedHeaders() : app;
++
++    /// <summary>API-key authentication is normally triggered by the authorization policy, which is too late for the limiter:
++    /// authenticate the key early (the result is cached for the request) so the limiter can pick the key's bucket and level.</summary>
++    public static IApplicationBuilder UseApiKeyPreAuthentication(this IApplicationBuilder app) =>
++        app.Use(async (ctx, next) =>
++        {
++            if (ctx.Request.Headers.ContainsKey(ApiKeyDefaults.Header))
++            {
++                var result = await ctx.AuthenticateAsync(ApiKeyDefaults.Scheme);
++                if (result.Succeeded) ctx.Items[ApiKeyItem] = result.Principal;
++            }
++            await next();
++        });
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' mid07/frontend/src/api/client.ts sol07/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-09-30 11:23:30.727722466 +0200
++++ b/frontend/src/api/client.ts	2026-09-30 11:28:07.295962951 +0200
+@@ -26,6 +26,10 @@
+   if (oidcUser && !oidcUser.expired) headers.set('Authorization', `Bearer ${oidcUser.access_token}`)
+   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json')
+   const res = await fetch(API_BASE + path, { ...init, headers })
++  if (res.status === 429) {
++    const wait = res.headers.get('Retry-After')
++    throw new Error(`Too many requests - please wait ${wait ?? 'a moment'} seconds and try again.`)
++  }
+   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+   return res.status === 204 ? (undefined as T) : res.json()
+ }

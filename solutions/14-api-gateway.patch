@@ -1,0 +1,684 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid14/backend/SecLab.slnx sol14/backend/SecLab.slnx
+--- a/backend/SecLab.slnx	2026-09-30 12:12:15.330960059 +0200
++++ b/backend/SecLab.slnx	2026-09-30 12:33:36.925127309 +0200
+@@ -1,5 +1,7 @@
+ <Solution>
+   <Project Path="src/SecLab.Api/SecLab.Api.csproj" />
+   <Project Path="src/SecLab.ExternalApi/SecLab.ExternalApi.csproj" />
++  <Project Path="src/SecLab.Gateway/SecLab.Gateway.csproj" />
+   <Project Path="tests/SecLab.Api.Tests/SecLab.Api.Tests.csproj" />
++  <Project Path="tests/SecLab.Gateway.Tests/SecLab.Gateway.Tests.csproj" />
+ </Solution>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid14/backend/src/SecLab.Api/Properties/launchSettings.json sol14/backend/src/SecLab.Api/Properties/launchSettings.json
+--- a/backend/src/SecLab.Api/Properties/launchSettings.json	2026-09-30 12:12:15.330450279 +0200
++++ b/backend/src/SecLab.Api/Properties/launchSettings.json	2026-09-30 12:33:36.925771342 +0200
+@@ -1,10 +1,14 @@
+ {
+   "profiles": {
+-    "http": {
++    "internal": {
+       "commandName": "Project",
+       "launchBrowser": false,
+-      "applicationUrl": "https://localhost:5443;http://localhost:5080",
+-      "environmentVariables": { "ASPNETCORE_ENVIRONMENT": "Development" }
++      "applicationUrl": "http://127.0.0.1:5100",
++      "environmentVariables": {
++        "ASPNETCORE_ENVIRONMENT": "Development",
++        "Proxy__KnownProxies__0": "127.0.0.1",
++        "Proxy__KnownProxies__1": "::1"
++      }
+     }
+   }
+ }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid14/backend/src/SecLab.Gateway/appsettings.json sol14/backend/src/SecLab.Gateway/appsettings.json
+--- a/backend/src/SecLab.Gateway/appsettings.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/appsettings.json	2026-09-30 12:35:05.070805265 +0200
+@@ -0,0 +1,49 @@
++{
++  "AllowedHosts": "localhost;seclab.example",
++  "Gateway": {
++    "RateLimitPerMinute": 300,
++    "MaxBodyBytes": 3145728,
++    "AdminNetworks": [ "127.0.0.1/32", "::1/128" ]
++  },
++  "ReverseProxy": {
++    "Routes": {
++      "avatars": {
++        "ClusterId": "api",
++        "Timeout": "00:00:30",
++        "Match": { "Path": "/avatars/{**catch-all}", "Methods": [ "GET", "HEAD" ] },
++        "Transforms": [
++          { "RequestHeaderOriginalHost": "true" },
++          { "X-Forwarded": "Set", "For": "Set", "Proto": "Set", "Host": "Set", "Prefix": "Off" },
++          { "ResponseHeaderRemove": "Server" }
++        ]
++      },
++      "api": {
++        "ClusterId": "api",
++        "Timeout": "00:00:30",
++        "Match": {
++          "Path": "/api/{**catch-all}",
++          "Methods": [ "GET", "POST", "PUT", "DELETE", "OPTIONS" ]
++        },
++        "Transforms": [
++          { "RequestHeaderOriginalHost": "true" },
++          { "X-Forwarded": "Set", "For": "Set", "Proto": "Set", "Host": "Set", "Prefix": "Off" },
++          { "RequestHeaderRemove": "Forwarded" },
++          { "RequestHeaderRemove": "X-Real-IP" },
++          { "RequestHeaderRemove": "X-Original-URL" },
++          { "RequestHeaderRemove": "X-Rewrite-URL" },
++          { "ResponseHeaderRemove": "Server" },
++          { "ResponseHeaderRemove": "X-Powered-By" },
++          { "ResponseHeaderRemove": "X-AspNet-Version" },
++          { "ResponseHeaderRemove": "X-AspNetMvc-Version" }
++        ]
++      }
++    },
++    "Clusters": {
++      "api": {
++        "Destinations": { "primary": { "Address": "http://127.0.0.1:5100/" } },
++        "HttpRequest": { "ActivityTimeout": "00:00:30" }
++      }
++    }
++  },
++  "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning", "Yarp": "Warning" } }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid14/backend/src/SecLab.Gateway/packages.lock.json sol14/backend/src/SecLab.Gateway/packages.lock.json
+--- a/backend/src/SecLab.Gateway/packages.lock.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/packages.lock.json	2026-09-30 12:33:36.924029994 +0200
+@@ -0,0 +1,21 @@
++{
++  "version": 1,
++  "dependencies": {
++    "net10.0": {
++      "Yarp.ReverseProxy": {
++        "type": "Direct",
++        "requested": "[2.3.0, )",
++        "resolved": "2.3.0",
++        "contentHash": "gxtkN3a+9biu9V9Zd5NaTO6VZWXAnS2mhQ0R/VXmSPoTuiQNZsakKikrKpDtKxrL5nUYzbRsHtl40WNq+ZBKKg==",
++        "dependencies": {
++          "System.IO.Hashing": "8.0.0"
++        }
++      },
++      "System.IO.Hashing": {
++        "type": "Transitive",
++        "resolved": "8.0.0",
++        "contentHash": "ne1843evDugl0md7Fjzy6QjJrzsjh46ZKbhf8GwBXb5f/gw97J4bxMs0NQKifDuThh/f0bZ0e62NPl1jzTuRqA=="
++      }
++    }
++  }
++}
+\ No newline at end of file
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid14/backend/src/SecLab.Gateway/Program.cs sol14/backend/src/SecLab.Gateway/Program.cs
+--- a/backend/src/SecLab.Gateway/Program.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/Program.cs	2026-09-30 12:34:10.806294072 +0200
+@@ -0,0 +1,114 @@
++using System.Net;
++using System.Security.Authentication;
++using System.Threading.RateLimiting;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.RateLimiting;
++using Yarp.ReverseProxy.Transforms;
++
++var builder = WebApplication.CreateBuilder(args);
++var gw = builder.Configuration.GetSection("Gateway");
++var permitsPerMinute = gw.GetValue("RateLimitPerMinute", 300);
++var maxBody = gw.GetValue("MaxBodyBytes", 3L * 1024 * 1024);
++var adminNetworks = (gw.GetSection("AdminNetworks").Get<string[]>() ?? []).Select(IPNetwork.Parse).ToArray();
++
++// ---- the edge is the only thing listening on the public port ----
++builder.WebHost.ConfigureKestrel(k =>
++{
++    k.AddServerHeader = false;
++    k.Limits.MaxRequestBodySize = maxBody;                       // chunked bodies too (the middleware below handles Content-Length early)
++    k.Limits.MaxRequestHeadersTotalSize = 32 * 1024;
++    k.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(15);   // slow-header attacks
++    k.ConfigureHttpsDefaults(h => h.SslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13);
++});
++builder.Services.AddHsts(o => { o.MaxAge = TimeSpan.FromDays(365); o.IncludeSubDomains = true; });
++builder.Services.AddProblemDetails();
++builder.Services.AddRequestTimeouts();                            // routes name their Timeout in configuration
++
++builder.Services.AddRateLimiter(o =>
++{
++    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
++    // Coarse, cheap, per client address. The API keeps its finer per-user / per-key limits (step 07).
++    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx => RateLimitPartition.GetFixedWindowLimiter(
++        ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
++        _ => new FixedWindowRateLimiterOptions { PermitLimit = permitsPerMinute, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
++    o.OnRejected = (context, _) =>
++    {
++        var seconds = context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var ra) ? (int)Math.Ceiling(ra.TotalSeconds) : 60;
++        context.HttpContext.Response.Headers.RetryAfter = Math.Max(1, seconds).ToString();
++        return ValueTask.CompletedTask;
++    };
++});
++
++builder.Services.AddReverseProxy()
++    .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"))
++    .AddTransforms(ctx => ctx.AddRequestTransform(t =>
++    {
++        // Anything a client sends that looks like "our" internal signalling never reaches the API.
++        foreach (var name in t.HttpContext.Request.Headers.Keys.Where(k => k.StartsWith("X-Gateway-", StringComparison.OrdinalIgnoreCase) || k.StartsWith("X-Internal-", StringComparison.OrdinalIgnoreCase)).ToList())
++            t.ProxyRequest.Headers.Remove(name);
++        return ValueTask.CompletedTask;
++    }));
++
++var app = builder.Build();
++
++if (!app.Environment.IsDevelopment()) app.UseHsts();
++app.UseHttpsRedirection();
++app.UseExceptionHandler(errors => errors.Run(async ctx =>                       // never show internals
++{
++    ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
++    await ctx.Response.WriteAsJsonAsync(new ProblemDetails { Status = 500, Title = "An unexpected error occurred." }, options: null, contentType: "application/problem+json");
++}));
++app.UseStatusCodePages();                                                        // bare 401/404/405/413/429/502 -> problem+json
++
++// Defensive headers on everything the gateway itself answers; responses from the API keep their own (add-if-absent).
++app.Use((ctx, next) =>
++{
++    ctx.Response.OnStarting(() =>
++    {
++        var h = ctx.Response.Headers;
++        foreach (var (n, v) in new[] { ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"), ("X-Frame-Options", "DENY"),
++                                        ("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'") })
++            if (!h.ContainsKey(n)) h[n] = v;
++        return Task.CompletedTask;
++    });
++    return next();
++});
++
++app.UseRateLimiter();            // counts everything, including what is refused below
++app.UseRequestTimeouts();
++
++// ---- edge policy: refuse cheap-to-refuse things before they cost the API anything ----
++app.Use(async (ctx, next) =>
++{
++    var req = ctx.Request;
++    var path = req.Path.Value ?? "";
++
++    if (path.Contains('\\') || path.Contains("..") || path.Contains("//")) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }
++    if (req.ContentLength > maxBody) { ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge; return; }
++
++    // Admin and debug functions do not exist for the internet.
++    var isPrivileged = req.Path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase) || req.Path.StartsWithSegments("/api/debug", StringComparison.OrdinalIgnoreCase);
++    if (isPrivileged)
++    {
++        var ip = ctx.Connection.RemoteIpAddress;
++        if (ip is { IsIPv4MappedToIPv6: true }) ip = ip.MapToIPv4();
++        if (ip is null || !adminNetworks.Any(n => n.Contains(ip))) { ctx.Response.StatusCode = StatusCodes.Status404NotFound; return; }
++    }
++
++    // Coarse authentication: a request to a protected API area must carry *some* credential of a supported type.
++    // The API still validates it properly (signature, issuer, audience, lifetime, scopes, ownership ...).
++    var isPublic = req.Path.StartsWithSegments("/api/auth", StringComparison.OrdinalIgnoreCase) || HttpMethods.IsOptions(req.Method);
++    if (!isPublic && req.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
++    {
++        var authorization = req.Headers.Authorization.ToString();
++        var hasBearer = authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) && authorization.Length > 10;
++        var hasKey = !string.IsNullOrWhiteSpace(req.Headers["X-Api-Key"].ToString());
++        if (!hasBearer && !hasKey) { ctx.Response.Headers.WWWAuthenticate = "Bearer"; ctx.Response.StatusCode = StatusCodes.Status401Unauthorized; return; }
++    }
++    await next();
++});
++
++app.MapReverseProxy();
++app.Run();
++
++public partial class Program;
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid14/backend/src/SecLab.Gateway/Properties/launchSettings.json sol14/backend/src/SecLab.Gateway/Properties/launchSettings.json
+--- a/backend/src/SecLab.Gateway/Properties/launchSettings.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/Properties/launchSettings.json	2026-09-30 12:33:36.923907894 +0200
+@@ -0,0 +1,10 @@
++{
++  "profiles": {
++    "https": {
++      "commandName": "Project",
++      "launchBrowser": false,
++      "applicationUrl": "https://localhost:5443;http://localhost:5080",
++      "environmentVariables": { "ASPNETCORE_ENVIRONMENT": "Development" }
++    }
++  }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid14/backend/src/SecLab.Gateway/SecLab.Gateway.csproj sol14/backend/src/SecLab.Gateway/SecLab.Gateway.csproj
+--- a/backend/src/SecLab.Gateway/SecLab.Gateway.csproj	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Gateway/SecLab.Gateway.csproj	2026-09-30 12:33:36.923922622 +0200
+@@ -0,0 +1,10 @@
++<Project Sdk="Microsoft.NET.Sdk.Web">
++  <PropertyGroup>
++    <TargetFramework>net10.0</TargetFramework>
++    <Nullable>enable</Nullable>
++    <ImplicitUsings>enable</ImplicitUsings>
++  </PropertyGroup>
++  <ItemGroup>
++    <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
++  </ItemGroup>
++</Project>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid14/backend/tests/SecLab.Gateway.Tests/packages.lock.json sol14/backend/tests/SecLab.Gateway.Tests/packages.lock.json
+--- a/backend/tests/SecLab.Gateway.Tests/packages.lock.json	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/SecLab.Gateway.Tests/packages.lock.json	2026-09-30 12:33:37.857605682 +0200
+@@ -0,0 +1,422 @@
++{
++  "version": 1,
++  "dependencies": {
++    "net10.0": {
++      "Microsoft.AspNetCore.Mvc.Testing": {
++        "type": "Direct",
++        "requested": "[10.0.12, )",
++        "resolved": "10.0.12",
++        "contentHash": "OtjgnL8RRLQYaiuS3KzbBbyQ6am1ZrX3dvBdiuXghxL+LQinmT2vMumytveYPbnXLknZSk/aEDKENI6uf7NoNg==",
++        "dependencies": {
++          "Microsoft.AspNetCore.TestHost": "10.0.12",
++          "Microsoft.Extensions.DependencyModel": "10.0.12",
++          "Microsoft.Extensions.Hosting": "10.0.12"
++        }
++      },
++      "Microsoft.NET.Test.Sdk": {
++        "type": "Direct",
++        "requested": "[17.14.1, )",
++        "resolved": "17.14.1",
++        "contentHash": "HJKqKOE+vshXra2aEHpi2TlxYX7Z9VFYkr+E5rwEvHC8eIXiyO+K9kNm8vmNom3e2rA56WqxU+/N9NJlLGXsJQ==",
++        "dependencies": {
++          "Microsoft.CodeCoverage": "17.14.1",
++          "Microsoft.TestPlatform.TestHost": "17.14.1"
++        }
++      },
++      "xunit": {
++        "type": "Direct",
++        "requested": "[2.9.3, )",
++        "resolved": "2.9.3",
++        "contentHash": "TlXQBinK35LpOPKHAqbLY4xlEen9TBafjs0V5KnA4wZsoQLQJiirCR4CbIXvOH8NzkW4YeJKP5P/Bnrodm0h9Q==",
++        "dependencies": {
++          "xunit.analyzers": "1.18.0",
++          "xunit.assert": "2.9.3",
++          "xunit.core": "[2.9.3]"
++        }
++      },
++      "xunit.runner.visualstudio": {
++        "type": "Direct",
++        "requested": "[3.1.0, )",
++        "resolved": "3.1.0",
++        "contentHash": "K9O9TOzugqOo4LJ87uuq1VG8RAqGp20Ng85Wx932oT5LNBkIgeeGYubVW5UMnOOTanFNbGavmbuYrJr4INzSwg=="
++      },
++      "Microsoft.AspNetCore.TestHost": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "bTHgbcjSrLxlqSasYRDU9BcJ3hDGoqIjtDY0soLNrndOWi3kxtOyddwUMaNZgtoI2Uf6y7ZQs2EuVj0c20B7mA=="
++      },
++      "Microsoft.CodeCoverage": {
++        "type": "Transitive",
++        "resolved": "17.14.1",
++        "contentHash": "pmTrhfFIoplzFVbhVwUquT+77CbGH+h4/3mBpdmIlYtBi9nAB+kKI6dN3A/nV4DFi3wLLx/BlHIPK+MkbQ6Tpg=="
++      },
++      "Microsoft.Extensions.Configuration": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "e3IPP32CRNL031VZJAUTlCTG0YN7WFh4mN3fsSHTDQCJB+3+f0jGycv4fXk3rrftaY3B85XrQaj7sRthrOsavg==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Primitives": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Configuration.Abstractions": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "8xaGcvS/qZ1otoxPQCEJkNva389CVL/plNcvIETZhQTETYdRkYDPEYhUMoAGONo4FU45ufdfE0j29AfWVVj0wA==",
++        "dependencies": {
++          "Microsoft.Extensions.Primitives": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Configuration.Binder": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "dAgIf1TOr8KLs+aBRIbXUZBjHoSH4rDG8+XkX/Q6AZwkQdMA0+yPDKTHsieeXdZDfpOpZVHzOnuAb5Z2nX3KsA==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "10.0.12",
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Configuration.CommandLine": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "hWWJzJpmg161rYJ2H6vxqCuFfh6zL2Tp9emOrfu1M4gsmW5BOlW8GldthyFwm2L+beW+0axmkMKRw3HyO1qceQ==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "10.0.12",
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Configuration.EnvironmentVariables": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "OIFhLxKAdvSrZuecX177ZkN4AcAB6OLlbS8y0MQYL68512aMOZI8cJLb8OeuYe2X+gu5uMqbbCxhzAmSp+Q2ow==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "10.0.12",
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Configuration.FileExtensions": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "PNPS7yYH9U2M0dExn0tMkQFVtE53xTlCs/dgTfsWTTFyCF6qwGT3VrTgm2nnnkSRlSmvM9/J+n9xCpyzd9xTpQ==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "10.0.12",
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12",
++          "Microsoft.Extensions.FileProviders.Abstractions": "10.0.12",
++          "Microsoft.Extensions.FileProviders.Physical": "10.0.12",
++          "Microsoft.Extensions.Primitives": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Configuration.Json": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "H4u2ZeIhjmRQvbHj7S7U4MK1kXb0khx3UtOWcir32VHczdFyIVF0lvHew/VVHmCF7Uk0QseAUaO7HyFKOCSiKA==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "10.0.12",
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Configuration.FileExtensions": "10.0.12",
++          "Microsoft.Extensions.FileProviders.Abstractions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Configuration.UserSecrets": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "2OtyTIt0/tkChr3inq9Y0c34xogxXW//68gvPzIWgKwyVR4x82RSGVSZfV+ZgG13zrKBzqjaI23wpUCfKpY2yQ==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Configuration.Json": "10.0.12",
++          "Microsoft.Extensions.FileProviders.Abstractions": "10.0.12",
++          "Microsoft.Extensions.FileProviders.Physical": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.DependencyInjection": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "lXyK2O5GoYvfxW8eCFcD16JFbcoSTM1sJkAM0UHS1jZyl9NYMW64Tqm6OQFT0IDBjZi+xHt95/Zg+nxZhGFhZg==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.DependencyInjection.Abstractions": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "9/qymSh7hVDMGTGwrLz8MRp5zRyXy9adGDOs4HwRdnLil3oZGYuWeZjbmHgCQ9BL1qBroVfgUK3U/nb61617Cw=="
++      },
++      "Microsoft.Extensions.DependencyModel": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "rDPQVTxh/zMTDF7wHlRqL/jjZbwjAP6315ydBxj51pZW7qkAwGwjoSiMutxYI91xmOE3ZXjAGHbYRqzyJV7Urw=="
++      },
++      "Microsoft.Extensions.Diagnostics": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "amx0O/R4dReqKlC3T740+CHpX8D8tAIV0f5kAPfFi4XK9jYo9BSepGt9/rWfvvCoSMaZ1+XvnqPp/Vv2fmTdAg==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "10.0.12",
++          "Microsoft.Extensions.Diagnostics.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Options.ConfigurationExtensions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Diagnostics.Abstractions": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "fMp91qlRlMOuHfMyp7LuAnOS+MOeWTF1obJmyFcs4nZCXu6pr+QB1AbFJcl2qpBltBrqF/Y7+Rn9IuNcSuctig==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Options": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.FileProviders.Abstractions": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "iQseV6HixWzEYQH4i++84ToIroXnM5jC1TJF4EqBz3lWNG1HBTMYDLkRb6Wm3wk5V6WqSfl7NukO/LYsloGyfg==",
++        "dependencies": {
++          "Microsoft.Extensions.Primitives": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.FileProviders.Physical": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "3cY+wo2+Qe65BVwShhr2fFqZv5Ns73h3kX4mpW3WvSgfT3AWCk0hKArKW4TF7Dg3mvbJdA6RhWPW7FR+PS5/1w==",
++        "dependencies": {
++          "Microsoft.Extensions.FileProviders.Abstractions": "10.0.12",
++          "Microsoft.Extensions.FileSystemGlobbing": "10.0.12",
++          "Microsoft.Extensions.Primitives": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.FileSystemGlobbing": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "45cV+UeI0chPAIXrx9Wv7K4PJXuuIR2pnOur5MOAo6kOFclBHSLLDrvGAxMfWRMtUvpv/kQZkxlgaUN56jwzSQ=="
++      },
++      "Microsoft.Extensions.Hosting": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "dzPj59oALFLu9TA4YUrfxqXEcbJVen/D2kOoitgM1lXBeSvPwPR8rOrrV0NKilCV3K0l4o+TLJJ3a1wmTu40Uw==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "10.0.12",
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Configuration.Binder": "10.0.12",
++          "Microsoft.Extensions.Configuration.CommandLine": "10.0.12",
++          "Microsoft.Extensions.Configuration.EnvironmentVariables": "10.0.12",
++          "Microsoft.Extensions.Configuration.FileExtensions": "10.0.12",
++          "Microsoft.Extensions.Configuration.Json": "10.0.12",
++          "Microsoft.Extensions.Configuration.UserSecrets": "10.0.12",
++          "Microsoft.Extensions.DependencyInjection": "10.0.12",
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Diagnostics": "10.0.12",
++          "Microsoft.Extensions.FileProviders.Abstractions": "10.0.12",
++          "Microsoft.Extensions.FileProviders.Physical": "10.0.12",
++          "Microsoft.Extensions.Hosting.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging": "10.0.12",
++          "Microsoft.Extensions.Logging.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging.Configuration": "10.0.12",
++          "Microsoft.Extensions.Logging.Console": "10.0.12",
++          "Microsoft.Extensions.Logging.Debug": "10.0.12",
++          "Microsoft.Extensions.Logging.EventLog": "10.0.12",
++          "Microsoft.Extensions.Logging.EventSource": "10.0.12",
++          "Microsoft.Extensions.Options": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Hosting.Abstractions": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "ZlIxIJtWmrph0Ikj0svSaTkZ+d+ZYpTAhazpf1b3aoFRmlNnNWwkcvqnqT9yKHjKvfBRthvUrkq11OxfItOhpg==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12",
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Diagnostics.Abstractions": "10.0.12",
++          "Microsoft.Extensions.FileProviders.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging.Abstractions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Logging": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "6I46fTPfgYkrjRYfRXbho9WOvOelTnNjWuZws/hzGHDASH1LEJeA4VKK9k3wJvido8o7jJSB5WkMTonX7HM1bA==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection": "10.0.12",
++          "Microsoft.Extensions.Logging.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Options": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Logging.Abstractions": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "+24lC4plfbEDNfLAdTV/SWKS7dW+16X4HdydO3R++134kSNTzcbYA4KpR1Hdh6uWisB8Za3AzwyOn+K+NxWIug==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Logging.Configuration": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "CLHWfKQZWFE6fSzRXfjd4UlGveckkfPtwx/p5yF/o3hEkMSzGsl7MSxNAkI19hjw0rprBqrQC09Dwy6Lh6kweA==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "10.0.12",
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Configuration.Binder": "10.0.12",
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging": "10.0.12",
++          "Microsoft.Extensions.Logging.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Options": "10.0.12",
++          "Microsoft.Extensions.Options.ConfigurationExtensions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Logging.Console": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "nHvaR8gO0CdEfG324KdUsP3Hqgdf1licZb+UlNh5pFYw7+o8QYTmiMgFmwayE/LPSpaqND/Qn3xHa1cI9b8x0w==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging": "10.0.12",
++          "Microsoft.Extensions.Logging.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging.Configuration": "10.0.12",
++          "Microsoft.Extensions.Options": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Logging.Debug": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "dEvvABq9Qgfu/SgTncXDjCshcJmgO97bLOnMAuqBDSonlk4+VXlKJMHPak+S78TlOxJ47+gY7vPgVukJsr69gg==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging": "10.0.12",
++          "Microsoft.Extensions.Logging.Abstractions": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Logging.EventLog": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "Qn0FWPMiQzM4GQEEXxrJbh3vp3I9wrAgpMcsVH36+6FTRGXaqtwHDgf/2030FUJ4OuNSpOeIRh+9kCZGDDsfGg==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging": "10.0.12",
++          "Microsoft.Extensions.Logging.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Options": "10.0.12",
++          "System.Diagnostics.EventLog": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Logging.EventSource": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "nKpYoiUdBu8fdLwDxj/fjjGn//7/VwRLzujtMq99/pExrswMXOz+80hbB98QxrD8qPt9oWlFpEVrN9OBKOP7RQ==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Logging": "10.0.12",
++          "Microsoft.Extensions.Logging.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Options": "10.0.12",
++          "Microsoft.Extensions.Primitives": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Options": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "TDYD33TSRpXKZWlmTXNlj5kCihxatmv2Ec1u6C+bMYLphCS7PoSLE9Pjd/nunDoE7yETk+LLKjVJX78HYtWjpA==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Primitives": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Options.ConfigurationExtensions": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "rqpu4qj5WE9x1IHGXSIgHBKi7IUlQaHyp4aXCYIanG2OghlUMFZpZTgExaXwcvmLAJHsxKQWMPpc7D2WIbCVtA==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Configuration.Binder": "10.0.12",
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.12",
++          "Microsoft.Extensions.Options": "10.0.12",
++          "Microsoft.Extensions.Primitives": "10.0.12"
++        }
++      },
++      "Microsoft.Extensions.Primitives": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "dYfCLR52UA+3DL7C4I/pvSaRPkNqxrUAQmbFL2u0zvYKKzqgrFCJl08Df+F1aYc8leu9JvpC9bsURUdpExcBXQ=="
++      },
++      "Microsoft.TestPlatform.ObjectModel": {
++        "type": "Transitive",
++        "resolved": "17.14.1",
++        "contentHash": "xTP1W6Mi6SWmuxd3a+jj9G9UoC850WGwZUps1Wah9r1ZxgXhdJfj1QqDLJkFjHDCvN42qDL2Ps5KjQYWUU0zcQ=="
++      },
++      "Microsoft.TestPlatform.TestHost": {
++        "type": "Transitive",
++        "resolved": "17.14.1",
++        "contentHash": "d78LPzGKkJwsJXAQwsbJJ7LE7D1wB+rAyhHHAaODF+RDSQ0NgMjDFkSA1Djw18VrxO76GlKAjRUhl+H8NL8Z+Q==",
++        "dependencies": {
++          "Microsoft.TestPlatform.ObjectModel": "17.14.1",
++          "Newtonsoft.Json": "13.0.3"
++        }
++      },
++      "Newtonsoft.Json": {
++        "type": "Transitive",
++        "resolved": "13.0.3",
++        "contentHash": "HrC5BXdl00IP9zeV+0Z848QWPAoCr9P3bDEZguI+gkLcBKAOxix/tLEAAHC+UvDNPv4a2d18lOReHMOagPa+zQ=="
++      },
++      "System.Diagnostics.EventLog": {
++        "type": "Transitive",
++        "resolved": "10.0.12",
++        "contentHash": "sOZM+VyRj1pg/ItlHsvrSbjws6oGqZveTzTNBGZ9ziwRDyKsOF3ub6vhvOdxotCIqtlnyHAIwP5sLNvgiZC+pQ=="
++      },
++      "System.IO.Hashing": {
++        "type": "Transitive",
++        "resolved": "8.0.0",
++        "contentHash": "ne1843evDugl0md7Fjzy6QjJrzsjh46ZKbhf8GwBXb5f/gw97J4bxMs0NQKifDuThh/f0bZ0e62NPl1jzTuRqA=="
++      },
++      "xunit.abstractions": {
++        "type": "Transitive",
++        "resolved": "2.0.3",
++        "contentHash": "pot1I4YOxlWjIb5jmwvvQNbTrZ3lJQ+jUGkGjWE3hEFM0l5gOnBWS+H3qsex68s5cO52g+44vpGzhAt+42vwKg=="
++      },
++      "xunit.analyzers": {
++        "type": "Transitive",
++        "resolved": "1.18.0",
++        "contentHash": "OtFMHN8yqIcYP9wcVIgJrq01AfTxijjAqVDy/WeQVSyrDC1RzBWeQPztL49DN2syXRah8TYnfvk035s7L95EZQ=="
++      },
++      "xunit.assert": {
++        "type": "Transitive",
++        "resolved": "2.9.3",
++        "contentHash": "/Kq28fCE7MjOV42YLVRAJzRF0WmEqsmflm0cfpMjGtzQ2lR5mYVj1/i0Y8uDAOLczkL3/jArrwehfMD0YogMAA=="
++      },
++      "xunit.core": {
++        "type": "Transitive",
++        "resolved": "2.9.3",
++        "contentHash": "BiAEvqGvyme19wE0wTKdADH+NloYqikiU0mcnmiNyXaF9HyHmE6sr/3DC5vnBkgsWaE6yPyWszKSPSApWdRVeQ==",
++        "dependencies": {
++          "xunit.extensibility.core": "[2.9.3]",
++          "xunit.extensibility.execution": "[2.9.3]"
++        }
++      },
++      "xunit.extensibility.core": {
++        "type": "Transitive",
++        "resolved": "2.9.3",
++        "contentHash": "kf3si0YTn2a8J8eZNb+zFpwfoyvIrQ7ivNk5ZYA5yuYk1bEtMe4DxJ2CF/qsRgmEnDr7MnW1mxylBaHTZ4qErA==",
++        "dependencies": {
++          "xunit.abstractions": "2.0.3"
++        }
++      },
++      "xunit.extensibility.execution": {
++        "type": "Transitive",
++        "resolved": "2.9.3",
++        "contentHash": "yMb6vMESlSrE3Wfj7V6cjQ3S4TXdXpRqYeNEI3zsX31uTsGMJjEw6oD5F5u1cHnMptjhEECnmZSsPxB6ChZHDQ==",
++        "dependencies": {
++          "xunit.extensibility.core": "[2.9.3]"
++        }
++      },
++      "Yarp.ReverseProxy": {
++        "type": "Transitive",
++        "resolved": "2.3.0",
++        "contentHash": "gxtkN3a+9biu9V9Zd5NaTO6VZWXAnS2mhQ0R/VXmSPoTuiQNZsakKikrKpDtKxrL5nUYzbRsHtl40WNq+ZBKKg==",
++        "dependencies": {
++          "System.IO.Hashing": "8.0.0"
++        }
++      },
++      "seclab.gateway": {
++        "type": "Project",
++        "dependencies": {
++          "Yarp.ReverseProxy": "[2.3.0, )"
++        }
++      }
++    }
++  }
++}
+\ No newline at end of file

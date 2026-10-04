@@ -1,0 +1,268 @@
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid11/backend/src/SecLab.Api/appsettings.json sol11/backend/src/SecLab.Api/appsettings.json
+--- a/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:50:47.729177164 +0200
++++ b/backend/src/SecLab.Api/appsettings.json	2026-09-30 11:56:07.207127645 +0200
+@@ -26,6 +26,9 @@
+   "Api": {
+     "V1SunsetDate": "2027-06-30"
+   },
++  "Diagnostics": {
++    "DetailedErrors": false
++  },
+   "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } },
+   "AllowedHosts": "localhost;seclab.example",
+   "Cors": {
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid11/backend/src/SecLab.Api/Endpoints/Api.cs sol11/backend/src/SecLab.Api/Endpoints/Api.cs
+--- a/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 11:50:47.741741533 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Api.cs	2026-09-30 12:00:31.740799941 +0200
+@@ -10,6 +10,7 @@
+ using SecLab.Api.Authorization;
+ using Microsoft.AspNetCore.RateLimiting;
+ using SecLab.Api.Data;
++using SecLab.Api.Errors;
+ using SecLab.Api.Models;
+ using SecLab.Api.Validation;
+ using System.ComponentModel.DataAnnotations;
+@@ -37,7 +38,7 @@
+         // ---- Auth ----
+         auth.MapPost("/register", async (RegisterRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
+         {
+-            if (await db.Users.AnyAsync(u => u.Username == req.Username)) return Results.Conflict(new { error = "Username is taken" });
++            if (await db.Users.AnyAsync(u => u.Username == req.Username)) return Problems.Create(StatusCodes.Status409Conflict, "That username is not available.");
+ 
+             var user = new User { Username = req.Username!, DisplayName = req.DisplayName ?? req.Username!, Email = req.Email!, PasswordIsHashed = true };
+             user.Password = hasher.HashPassword(user, req.Password!);
+@@ -49,7 +50,7 @@
+         auth.MapPost("/login", async (LoginRequest req, AppDbContext db, IPasswordHasher<User> hasher) =>
+         {
+             // One answer for every failure: unknown user, wrong password and locked account look identical.
+-            IResult Fail() => Results.Json(new { error = "Invalid username or password" }, statusCode: 401);
++            IResult Fail() => Problems.Create(StatusCodes.Status401Unauthorized, "Authentication failed.");
+ 
+             var user = await db.Users.FirstOrDefaultAsync(u => u.Username == req.Username);
+             if (user is null)
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid11/backend/src/SecLab.Api/Endpoints/Tools.cs sol11/backend/src/SecLab.Api/Endpoints/Tools.cs
+--- a/backend/src/SecLab.Api/Endpoints/Tools.cs	2026-09-30 11:50:47.729079050 +0200
++++ b/backend/src/SecLab.Api/Endpoints/Tools.cs	2026-09-30 12:00:31.745751409 +0200
+@@ -1,6 +1,7 @@
+ using System.Net;
+ using System.Text;
+ using System.Text.RegularExpressions;
++using SecLab.Api.Errors;
+ using SecLab.Api.Security;
+ 
+ namespace SecLab.Api.Endpoints;
+@@ -25,8 +26,8 @@
+             {
+                 using var response = await clients.CreateClient("outbound").GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, ct);
+                 if (response.StatusCode is >= HttpStatusCode.MultipleChoices and < HttpStatusCode.BadRequest)
+-                    return Results.Problem("The site redirected; redirects are not followed.", statusCode: StatusCodes.Status502BadGateway);
+-                if (!response.IsSuccessStatusCode) return Results.Problem("The site did not answer successfully.", statusCode: StatusCodes.Status502BadGateway);
++                    return Problems.Create(StatusCodes.Status502BadGateway, "The site redirected; redirects are not followed.");
++                if (!response.IsSuccessStatusCode) return Problems.Create(StatusCodes.Status502BadGateway, "The site did not answer successfully.");
+ 
+                 await using var stream = await response.Content.ReadAsStreamAsync(ct);
+                 var buffer = new byte[MaxBytes + 1];
+@@ -37,7 +38,7 @@
+                     if (n == 0) break;
+                     read += n;
+                 }
+-                if (read > MaxBytes) return Results.Problem("The response is too large.", statusCode: StatusCodes.Status502BadGateway);
++                if (read > MaxBytes) return Problems.Create(StatusCodes.Status502BadGateway, "The response is too large.");
+ 
+                 var m = TitleRegex().Match(Encoding.UTF8.GetString(buffer, 0, read));
+                 var title = m.Success ? Regex.Replace(WebUtility.HtmlDecode(m.Groups[1].Value), @"\s+", " ").Trim() : null;
+@@ -45,7 +46,7 @@
+             }
+             catch (Exception e) when (e is HttpRequestException or TaskCanceledException)
+             {
+-                return Results.Problem("The site could not be reached.", statusCode: StatusCodes.Status502BadGateway);
++                return Problems.Create(StatusCodes.Status502BadGateway, "The site could not be reached.");
+             }
+         });
+     }
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid11/backend/src/SecLab.Api/Errors/AlwaysJsonProblemWriter.cs sol11/backend/src/SecLab.Api/Errors/AlwaysJsonProblemWriter.cs
+--- a/backend/src/SecLab.Api/Errors/AlwaysJsonProblemWriter.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Errors/AlwaysJsonProblemWriter.cs	2026-09-30 11:58:43.918683095 +0200
+@@ -0,0 +1,27 @@
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.Extensions.Options;
++
++namespace SecLab.Api.Errors;
++
++/// <summary>
++/// The built-in writer stays silent when the request's Accept header does not include JSON (a browser navigating to the API sends
++/// text/html). This API only ever speaks JSON, so errors are always written as problem+json - never an HTML page, never an empty body.
++/// Must be registered BEFORE AddProblemDetails so it is tried first.
++/// </summary>
++public class AlwaysJsonProblemWriter(IOptions<ProblemDetailsOptions> options) : IProblemDetailsWriter
++{
++    public bool CanWrite(ProblemDetailsContext context) => true;
++
++    public ValueTask WriteAsync(ProblemDetailsContext context)
++    {
++        var http = context.HttpContext;
++        var problem = context.ProblemDetails;
++        problem.Status ??= http.Response.StatusCode;
++        problem.Title ??= Microsoft.AspNetCore.WebUtilities.ReasonPhrases.GetReasonPhrase(problem.Status.Value);
++        http.Response.StatusCode = problem.Status.Value;
++        options.Value.CustomizeProblemDetails?.Invoke(context);            // trace id, cache headers ...
++        // serialise by the RUNTIME type: HttpValidationProblemDetails has an "errors" member the base type does not
++        return new ValueTask(http.Response.WriteAsJsonAsync(problem, problem.GetType(), (System.Text.Json.JsonSerializerOptions?)null, "application/problem+json", http.RequestAborted));
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid11/backend/src/SecLab.Api/Errors/GlobalExceptionHandler.cs sol11/backend/src/SecLab.Api/Errors/GlobalExceptionHandler.cs
+--- a/backend/src/SecLab.Api/Errors/GlobalExceptionHandler.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Errors/GlobalExceptionHandler.cs	2026-09-30 11:56:07.199478787 +0200
+@@ -0,0 +1,36 @@
++using System.Diagnostics;
++using Microsoft.AspNetCore.Diagnostics;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.EntityFrameworkCore;
++
++namespace SecLab.Api.Errors;
++
++/// <summary>
++/// The only place where exceptions turn into responses. Callers get a generic problem-details body and a trace id;
++/// the exception itself (message, stack, inner SQL errors) goes to the log where the trace id lets you find it.
++/// </summary>
++public class GlobalExceptionHandler(IProblemDetailsService problems, ILogger<GlobalExceptionHandler> logger, IConfiguration config) : IExceptionHandler
++{
++    public async ValueTask<bool> TryHandleAsync(HttpContext ctx, Exception exception, CancellationToken ct)
++    {
++        if (exception is OperationCanceledException && ctx.RequestAborted.IsCancellationRequested) return true;   // the client left; nothing to say
++
++        var (status, title) = exception switch
++        {
++            BadHttpRequestException b => (b.StatusCode, "The request could not be read."),
++            DbUpdateConcurrencyException => (StatusCodes.Status409Conflict, "The resource was changed by someone else. Reload and try again."),
++            _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred."),
++        };
++
++        var traceId = Activity.Current?.Id ?? ctx.TraceIdentifier;
++        if (status >= 500) logger.LogError(exception, "Unhandled exception. TraceId={TraceId} Path={Path}", traceId, ctx.Request.Path.Value);
++        else logger.LogWarning("Request failed with {Status}: {Message}. TraceId={TraceId}", status, exception.Message, traceId);
++
++        ctx.Response.StatusCode = status;
++        var problem = new ProblemDetails { Status = status, Title = title };
++        if (config.GetValue<bool>("Diagnostics:DetailedErrors"))          // explicit opt-in for a developer's own machine
++            problem.Detail = exception.ToString();
++
++        return await problems.TryWriteAsync(new ProblemDetailsContext { HttpContext = ctx, ProblemDetails = problem, Exception = exception });
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid11/backend/src/SecLab.Api/Errors/Problems.cs sol11/backend/src/SecLab.Api/Errors/Problems.cs
+--- a/backend/src/SecLab.Api/Errors/Problems.cs	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/src/SecLab.Api/Errors/Problems.cs	2026-09-30 12:00:31.726729922 +0200
+@@ -0,0 +1,25 @@
++using Microsoft.AspNetCore.Mvc;
++
++namespace SecLab.Api.Errors;
++
++/// <summary>
++/// Use this instead of Results.Problem(): it goes through IProblemDetailsService, so the trace id, X-Trace-Id and
++/// no-store headers are added exactly as for every other error.
++/// </summary>
++public static class Problems
++{
++    public static IResult Create(int status, string title) => new ProblemResult(status, title);
++
++    sealed class ProblemResult(int status, string title) : IResult
++    {
++        public async Task ExecuteAsync(HttpContext ctx)
++        {
++            ctx.Response.StatusCode = status;
++            await ctx.RequestServices.GetRequiredService<IProblemDetailsService>().TryWriteAsync(new ProblemDetailsContext
++            {
++                HttpContext = ctx,
++                ProblemDetails = new ProblemDetails { Status = status, Title = title },
++            });
++        }
++    }
++}
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid11/backend/src/SecLab.Api/Program.cs sol11/backend/src/SecLab.Api/Program.cs
+--- a/backend/src/SecLab.Api/Program.cs	2026-09-30 11:50:47.741653608 +0200
++++ b/backend/src/SecLab.Api/Program.cs	2026-09-30 11:57:42.871712475 +0200
+@@ -5,6 +5,7 @@
+ using Microsoft.AspNetCore.Authentication.JwtBearer;
+ using Microsoft.AspNetCore.Authorization;
+ using SecLab.Api.Authorization;
++using SecLab.Api.Errors;
+ using SecLab.Api.RateLimiting;
+ using SecLab.Api.Security;
+ using SecLab.Api.Validation;
+@@ -18,6 +19,7 @@
+ builder.WebHost.ConfigureKestrel(k =>
+ {
+     k.ConfigureHttpsDefaults(h => h.SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13);
++    k.AddServerHeader = false;                          // do not announce the web server
+     k.Limits.MaxRequestBodySize = 3 * 1024 * 1024;     // nothing in this API needs bigger requests (avatars are capped at 2 MB)
+ });
+ 
+@@ -40,7 +42,16 @@
+ builder.Services.AddScoped<IAuthorizationHandler, BlogResourceHandler>();
+ var v1Sunset = DateTimeOffset.Parse(builder.Configuration["Api:V1SunsetDate"] ?? "2027-06-30", System.Globalization.CultureInfo.InvariantCulture,
+     System.Globalization.DateTimeStyles.AssumeUniversal);
+-builder.Services.AddProblemDetails();
++builder.Services.AddSingleton<Microsoft.AspNetCore.Http.IProblemDetailsWriter, AlwaysJsonProblemWriter>();   // before AddProblemDetails: tried first
++builder.Services.AddProblemDetails(o => o.CustomizeProblemDetails = ctx =>
++{
++    // Every error, whoever produced it, carries the same correlation data and is never cached.
++    var traceId = System.Diagnostics.Activity.Current?.Id ?? ctx.HttpContext.TraceIdentifier;
++    ctx.ProblemDetails.Extensions["traceId"] = traceId;
++    ctx.HttpContext.Response.Headers["X-Trace-Id"] = traceId;
++    ctx.HttpContext.Response.Headers.CacheControl = "no-store";
++});
++builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+ builder.Services.AddValidation();                                  // .NET 10: DataAnnotations on endpoint parameters -> automatic 400 problem details
+ builder.Services.AddSingleton<ContentSanitizer>();
+ builder.Services.AddApiVersioning(o =>
+@@ -84,7 +95,9 @@
+ 
+ // WEAKNESS: developer exception page always on (leaks stack traces), plain HTTP only.
+ app.UseSecLabForwardedHeaders(app.Configuration);   // first: everything after sees the trusted client address/scheme (only if proxies are configured)
+-app.UseDeveloperExceptionPage();
++// No developer exception page: it prints source, stack and configuration to whoever triggers an error.
++app.UseExceptionHandler();                    // -> GlobalExceptionHandler -> problem+json
++app.UseStatusCodePages();                     // 401/403/404/405/415 ... without a body get a problem+json body too
+ if (!app.Environment.IsDevelopment()) app.UseHsts();   // browsers remember: HTTPS only (skipped on localhost by design)
+ app.UseHttpsRedirection();
+ app.Use((ctx, next) =>
+diff --color -ruN -x bin -x obj -x dist -x node_modules -x certs -x '*.log' -x '*.png' mid11/frontend/src/api/client.ts sol11/frontend/src/api/client.ts
+--- a/frontend/src/api/client.ts	2026-09-30 11:50:47.729504279 +0200
++++ b/frontend/src/api/client.ts	2026-09-30 12:00:31.745794029 +0200
+@@ -21,6 +21,25 @@
+   return raw ? JSON.parse(raw) : null
+ }
+ 
++export class ApiError extends Error {
++  status: number
++  traceId?: string
++  errors?: Record<string, string[]>
++  constructor(status: number, message: string, traceId?: string, errors?: Record<string, string[]>) {
++    super(message)
++    this.status = status; this.traceId = traceId; this.errors = errors
++  }
++}
++
++// Servers answer with RFC 9457 problem details. Show the human part, keep the trace id so support can find the log line.
++async function toApiError(res: Response): Promise<ApiError> {
++  let body: { title?: string; errors?: Record<string, string[]>; traceId?: string } = {}
++  try { body = await res.json() } catch { /* not JSON: fall through */ }
++  const fields = body.errors ? Object.values(body.errors).flat().join(' ') : ''
++  const ref = body.traceId ?? res.headers.get('X-Trace-Id') ?? undefined
++  return new ApiError(res.status, `${body.title ?? res.statusText}${fields ? ' ' + fields : ''}${ref ? ` (ref ${ref})` : ''}`, ref, body.errors)
++}
++
+ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+   const headers = new Headers(init.headers)
+   headers.set('api-version', API_VERSION)          // always say which contract we speak
+@@ -32,7 +51,7 @@
+     const wait = res.headers.get('Retry-After')
+     throw new Error(`Too many requests - please wait ${wait ?? 'a moment'} seconds and try again.`)
+   }
+-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
++  if (!res.ok) throw await toApiError(res)
+   return res.status === 204 ? (undefined as T) : res.json()
+ }
+ 
