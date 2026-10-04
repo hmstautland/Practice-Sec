@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/SecLab.Api/SecLab.Api.csproj" />
+  <Project Path="src/SecLab.ExternalApi/SecLab.ExternalApi.csproj" />
+  <Project Path="tests/SecLab.Api.Tests/SecLab.Api.Tests.csproj" />
+</Solution>
