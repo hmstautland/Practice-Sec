@@ -1,0 +1,109 @@
+# Reusable workflow called by deploy.yml, once per environment. Copy to .github/workflows/deploy-env.yml
+# The same digest that was built and scanned once is deployed to every environment.
+name: deploy-env
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      api_image:
+        required: true
+        type: string
+      external_image:
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }}   # gates the job and selects this environment's variables and credential subject
+    env:
+      # Values come from inputs (built by the previous job) and environment *variables*; used only via shell variables.
+      RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+      ENV_NAME: ${{ inputs.environment }}
+      API_IMAGE: ${{ inputs.api_image }}
+      EXTERNAL_IMAGE: ${{ inputs.external_image }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      ACR_RG: ${{ vars.ACR_RESOURCE_GROUP }}
+      ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+      FRONT_DOOR_ID: ${{ vars.FRONT_DOOR_ID }}      # empty on the first deployment; set it from the output afterwards
+      SQL_ADMIN_GROUP_OID: ${{ vars.SQL_ADMIN_GROUP_OBJECT_ID }}
+      SQL_ADMIN_GROUP_NAME: ${{ vars.SQL_ADMIN_GROUP_NAME }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@<commit-sha> # v<x.y.z>
+        with:
+          persist-credentials: false
+
+      - name: Log in to Azure (OIDC, no secret)
+        uses: azure/login@<commit-sha> # v<x.y.z>
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if (review aid, appears in the run log)
+        shell: bash
+        run: |
+          az deployment group what-if -g "$RG" -f infra/main.bicep \
+            -p env="$ENV_NAME" apiImage="$API_IMAGE" externalApiImage="$EXTERNAL_IMAGE" \
+               acrName="$ACR_NAME" acrResourceGroup="$ACR_RG" alertEmail="$ALERT_EMAIL" frontDoorId="$FRONT_DOOR_ID" \
+               sqlAdminGroupObjectId="$SQL_ADMIN_GROUP_OID" sqlAdminGroupName="$SQL_ADMIN_GROUP_NAME"
+
+      - name: Deploy infrastructure and new image digests
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(az deployment group create -g "$RG" -f infra/main.bicep \
+            -p env="$ENV_NAME" apiImage="$API_IMAGE" externalApiImage="$EXTERNAL_IMAGE" \
+               acrName="$ACR_NAME" acrResourceGroup="$ACR_RG" alertEmail="$ALERT_EMAIL" frontDoorId="$FRONT_DOOR_ID" \
+               sqlAdminGroupObjectId="$SQL_ADMIN_GROUP_OID" sqlAdminGroupName="$SQL_ADMIN_GROUP_NAME" \
+            --query properties.outputs -o json)"
+          echo "api_url=$(jq -r .apiUrl.value <<<"$out")"          >> "$GITHUB_OUTPUT"
+          echo "swa_name=$(jq -r .staticSiteName.value <<<"$out")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@<commit-sha> # v<x.y.z>
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend for this environment
+        working-directory: frontend
+        env:
+          API_URL: ${{ steps.deploy.outputs.api_url }}
+        run: |
+          npm ci --ignore-scripts
+          VITE_API_BASE="$API_URL" npm run build       # requires the frontend to read its API base from import.meta.env
+
+      - name: Fetch the Static Web Apps deployment token at run time (never stored in GitHub)
+        id: swa
+        env:
+          SWA_NAME: ${{ steps.deploy.outputs.swa_name }}
+        run: |
+          set -euo pipefail
+          token="$(az staticwebapp secrets list -g "$RG" -n "$SWA_NAME" --query properties.apiKey -o tsv)"
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Upload frontend
+        uses: Azure/static-web-apps-deploy@<commit-sha> # v<x.y.z> - check the current version and inputs
+        with:
+          action: upload
+          azure_static_web_apps_api_token: ${{ steps.swa.outputs.token }}
+          app_location: frontend/dist
+          skip_app_build: true
+          skip_api_build: true
+
+      - name: Smoke test
+        env:
+          BASE_URL: ${{ steps.deploy.outputs.api_url }}
+        run: bash scripts/smoke.sh "$BASE_URL"     # from solutions/p2-05-operate/smoke.sh

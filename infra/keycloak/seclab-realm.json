@@ -1,0 +1,178 @@
+{
+  "realm": "seclab",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 28800,
+  "revokeRefreshToken": true,
+  "refreshTokenMaxReuse": 0,
+  "clients": [
+    {
+      "clientId": "seclab-spa",
+      "name": "SecLab React SPA",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "https://localhost:5173/*"
+      ],
+      "webOrigins": [
+        "https://localhost:5173"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://localhost:5173/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "seclab-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "seclab-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "seclab-bff",
+      "name": "SecLab BFF (the gateway) - confidential client, step 17",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "https://localhost:5173/bff/callback",
+        "https://localhost:5443/bff/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://localhost:5173/##https://localhost:5443/"
+      },
+      "protocolMappers": [
+        {
+          "name": "seclab-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "seclab-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "seclab-api",
+      "name": "SecLab API (resource server)",
+      "enabled": true,
+      "bearerOnly": true
+    },
+    {
+      "clientId": "seclab-dev-cli",
+      "name": "DEV ONLY: password grant for scripts/tests",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "seclab-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "seclab-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "alice@example.com",
+      "firstName": "Alice",
+      "lastName": "Andersen",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password123",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "bob@example.com",
+      "firstName": "Bob",
+      "lastName": "Berg",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password123",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "carol",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "carol@example.com",
+      "firstName": "Carol",
+      "lastName": "Christensen",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password123",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "dave",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "dave@example.com",
+      "firstName": "Dave",
+      "lastName": "Dahl",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password123",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "eve",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "eve@example.com",
+      "firstName": "Eve",
+      "lastName": "Eriksen",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password123",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

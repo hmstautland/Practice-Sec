@@ -1,0 +1,177 @@
+# Reference solution for P2-02 -> copy to .github/workflows/ci.yml
+# Every `<commit-sha>` is a placeholder. Look up the commit of the release tag you want, e.g.
+#   gh api repos/actions/checkout/git/ref/tags/v<x.y.z> --jq .object.sha     (lightweight tag)
+#   (annotated tags: dereference with gh api repos/<owner>/<repo>/git/tags/<sha> --jq .object.sha)
+# or open the release page and copy the full 40-char commit id. Keep "# v<x.y.z>" as a comment.
+# Check the current version of every action first. Dependabot (github-actions ecosystem) updates the SHAs.
+name: ci
+
+on:
+  pull_request:            # NOT pull_request_target: fork PRs run with a read-only token and no secrets
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"   # weekly: the mutation job (step 16)
+  workflow_dispatch:
+
+permissions:
+  contents: read           # default for every job; raised per job below only where needed
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@<commit-sha> # v<x.y.z>
+        with:
+          persist-credentials: false        # the token is not left in .git/config for later steps
+      - uses: actions/setup-dotnet@<commit-sha> # v<x.y.z>
+        with:
+          dotnet-version: 10.0.x
+      - name: Restore and build
+        # CI=true (set by GitHub) switches on RestoreLockedMode in backend/Directory.Build.props: the lock files decide the versions
+        run: |
+          dotnet restore backend/SecLab.slnx
+          dotnet build backend/SecLab.slnx -c Release --no-restore
+      - name: Unit tests (step 16, Kind=Unit - no database, runs first so a broken helper fails in seconds)
+        run: dotnet test backend/SecLab.slnx -c Release --no-build --filter "Kind=Unit"
+      - name: Database - exactly as on a laptop (step 15)
+        # init-secrets.sh generates random throw-away passwords, the pinned TLS certificate and .env for THIS run; nothing is stored.
+        # A GitHub service container cannot mount that certificate, and the tests refuse TrustServerCertificate=True.
+        run: |
+          bash docs/init-secrets.sh
+          docker compose up -d --wait sqlserver
+          bash docs/init-database.sh
+      - name: Test - the whole suite (SQL Server based steps, matrix, contract, integration)
+        run: |
+          set -a; . ./.env; set +a          # ConnectionStrings__Default / __Migrator for the API and the tests
+          dotnet test backend/SecLab.slnx -c Release --no-build --logger "trx;LogFileName=test.trx"
+      - name: Fail on vulnerable NuGet packages (direct and transitive)
+        run: |
+          dotnet list backend/SecLab.slnx package --vulnerable --include-transitive 2>&1 | tee vulnerable.txt
+          if grep -q "has the following vulnerable packages" vulnerable.txt; then
+            echo "::error::Vulnerable NuGet packages found (see log)"; exit 1
+          fi
+      - uses: actions/upload-artifact@<commit-sha> # v<x.y.z>
+        if: always()
+        with:
+          name: backend-test-results
+          path: "**/test.trx"
+          if-no-files-found: ignore
+
+  mutation:
+    # Mutation testing of the security helpers (step 16). Slow-ish and unit-test only: not on every push.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@<commit-sha> # v<x.y.z>
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@<commit-sha> # v<x.y.z>
+        with:
+          dotnet-version: 10.0.x
+      - name: Stryker.NET (fails below the break threshold in stryker-config.json)
+        working-directory: backend/tests/SecLab.Api.Tests
+        run: |
+          dotnet tool restore
+          dotnet stryker
+      - uses: actions/upload-artifact@<commit-sha> # v<x.y.z>
+        if: always()
+        with:
+          name: mutation-report
+          path: backend/tests/SecLab.Api.Tests/StrykerOutput/**/reports/*
+          if-no-files-found: ignore
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@<commit-sha> # v<x.y.z>
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@<commit-sha> # v<x.y.z>
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install (lockfile only), build, audit
+        working-directory: frontend
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          npm audit --audit-level=high
+
+  codeql:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write   # upload SARIF results to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [csharp, javascript-typescript]
+    steps:
+      - uses: actions/checkout@<commit-sha> # v<x.y.z>
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@<commit-sha> # v<x.y.z>
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none          # supported for these languages; check the current docs
+      - uses: github/codeql-action/analyze@<commit-sha> # v<x.y.z>
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read           # needs the dependency graph enabled on the repository
+    steps:
+      - uses: actions/checkout@<commit-sha> # v<x.y.z>
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@<commit-sha> # v<x.y.z>
+        with:
+          fail-on-severity: high
+
+  images:
+    # Build only (no registry login, no push) + scan. The push happens in deploy.yml on main.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            dockerfile: backend/src/SecLab.Api/Dockerfile
+          - name: externalapi
+            dockerfile: backend/src/SecLab.ExternalApi/Dockerfile
+    steps:
+      - uses: actions/checkout@<commit-sha> # v<x.y.z>
+        with:
+          persist-credentials: false
+      - name: Build image
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: docker build -f "$DOCKERFILE" -t "seclab-$IMAGE_NAME:ci" backend
+      - name: Scan image (fail on HIGH/CRITICAL that have a fix)
+        uses: aquasecurity/trivy-action@<commit-sha> # v<x.y.z>
+        with:
+          image-ref: seclab-${{ matrix.name }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

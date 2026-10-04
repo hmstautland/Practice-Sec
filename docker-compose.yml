@@ -1,0 +1,42 @@
+# Intentionally insecure starter: the SA password is weak and committed on purpose.
+# Fixing this is part of the "Database & SQL security" tutorial step.
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: seclab-sql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Passw0rd!Passw0rd"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqldata:/var/opt/mssql
+  # Identity provider for step 03 (OAuth2 / OpenID Connect). Dev mode, HTTP, weak admin password: local lab only.
+  # Start with:  docker compose --profile oidc up -d keycloak     (admin console: http://localhost:8081, admin/admin)
+  keycloak:
+    profiles: ["oidc"]
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: seclab-keycloak
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+  # Observability for step 12: a local OpenTelemetry dashboard (traces, metrics, structured logs). Lab only: no authentication.
+  # Start with:  docker compose --profile observability up -d dashboard      UI: http://localhost:18888
+  # Point the API at it:  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317  (gRPC)
+  dashboard:
+    profiles: ["observability"]
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:9.0
+    container_name: seclab-dashboard
+    environment:
+      DASHBOARD__FRONTEND__AUTHMODE: Unsecured
+      DASHBOARD__OTLP__AUTHMODE: Unsecured
+    ports:
+      - "18888:18888"
+      - "4317:18889"
+volumes:
+  sqldata:

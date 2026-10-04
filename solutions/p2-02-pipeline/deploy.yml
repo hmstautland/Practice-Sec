@@ -1,0 +1,110 @@
+# Reference solution for P2-02 -> copy to .github/workflows/deploy.yml (and deploy-env.yml next to it).
+# Placeholders: <commit-sha> = full commit SHA of the action release (see ci.yml header).
+# GitHub setup needed (see docs/solutions/p2-02-github-actions-pipeline.md):
+#   environments: build, dev, test, prod   (test/prod: required reviewers; prod: branch policy = main only)
+#   per-environment *variables* (not secrets): AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#   (also ACR_RESOURCE_GROUP, ALERT_EMAIL, FRONT_DOOR_ID - the latter empty on the first run)
+#   AZURE_RESOURCE_GROUP, ACR_NAME (build), SQL_ADMIN_GROUP_OBJECT_ID, SQL_ADMIN_GROUP_NAME, ...
+name: deploy
+
+on:
+  push:
+    branches: [main]       # main is protected: PR + review + green ci before anything lands here
+  workflow_dispatch:
+
+permissions: {}            # nothing by default; each job asks for what it needs
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false   # never cancel a half-finished deployment
+
+jobs:
+  build-push:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: build       # federated credential subject: repo:<owner>/<repo>:environment:build (AcrPush only)
+    permissions:
+      contents: read
+      id-token: write        # mint the OIDC token for azure/login
+    outputs:
+      api_ref: ${{ steps.push.outputs.api_ref }}
+      external_ref: ${{ steps.push.outputs.external_ref }}
+    steps:
+      - uses: actions/checkout@<commit-sha> # v<x.y.z>
+        with:
+          persist-credentials: false
+      - name: Build images
+        run: |
+          docker build -f backend/src/SecLab.Api/Dockerfile         -t seclab-api:ci         backend
+          docker build -f backend/src/SecLab.ExternalApi/Dockerfile -t seclab-externalapi:ci backend
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@<commit-sha> # v<x.y.z>
+        with:
+          image-ref: seclab-api:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Scan ExternalApi image
+        uses: aquasecurity/trivy-action@<commit-sha> # v<x.y.z>
+        with:
+          image-ref: seclab-externalapi:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Log in to Azure (OIDC, no secret)
+        uses: azure/login@<commit-sha> # v<x.y.z>
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Push to ACR and record digests
+        id: push
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          az acr login --name "$ACR_NAME"
+          server="$ACR_NAME.azurecr.io"
+          for pair in "api:api_ref" "externalapi:external_ref"; do
+            img="${pair%%:*}"; out="${pair##*:}"
+            docker tag "seclab-$img:ci" "$server/seclab-$img:$SHA"
+            docker push "$server/seclab-$img:$SHA"
+            ref="$(docker inspect --format '{{index .RepoDigests 0}}' "$server/seclab-$img:$SHA")"
+            case "$ref" in "$server/seclab-$img@sha256:"*) ;; *) echo "::error::unexpected digest ref"; exit 1;; esac
+            echo "$out=$ref" >> "$GITHUB_OUTPUT"
+          done
+
+  deploy-dev:
+    needs: build-push
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: dev
+      api_image: ${{ needs.build-push.outputs.api_ref }}
+      external_image: ${{ needs.build-push.outputs.external_ref }}
+
+  deploy-test:
+    needs: [build-push, deploy-dev]      # deploy-dev includes its smoke test
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: test                  # protection rule: required reviewers (optional wait timer)
+      api_image: ${{ needs.build-push.outputs.api_ref }}
+      external_image: ${{ needs.build-push.outputs.external_ref }}
+
+  deploy-prod:
+    needs: [build-push, deploy-test]
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: prod                  # protection rules: required reviewers, prevent self-review, branch main only
+      api_image: ${{ needs.build-push.outputs.api_ref }}
+      external_image: ${{ needs.build-push.outputs.external_ref }}

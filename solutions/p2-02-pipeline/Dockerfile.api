@@ -1,0 +1,15 @@
+# Reference Dockerfile for SecLab.Api (copy to backend/src/SecLab.Api/Dockerfile; build context = backend/).
+# For SecLab.ExternalApi change the project path. Not built or tested here - check base image tags.
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet publish src/SecLab.Api/SecLab.Api.csproj -c Release -o /out --no-self-contained
+
+# chiseled = no shell, no package manager, non-root by default
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled AS final
+WORKDIR /app
+COPY --from=build /out .
+ENV ASPNETCORE_URLS=http://+:8080
+EXPOSE 8080
+USER $APP_UID
+ENTRYPOINT ["dotnet", "SecLab.Api.dll"]

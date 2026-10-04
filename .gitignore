@@ -1,0 +1,14 @@
+bin/
+obj/
+node_modules/
+dist/
+.vs/
+*.user
+.env
+appsettings.*.local.json
+backend/src/SecLab.Api/wwwroot/avatars/*
+!backend/src/SecLab.Api/wwwroot/avatars/.gitkeep
+certs/
+.env
+
+CLAUDE.md
